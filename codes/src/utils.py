@@ -30,16 +30,15 @@ def compute_metrics(rank_list, ground_truth, k_list=[10, 20]):
     return metrics
 
 @torch.no_grad()
-def evaluate_model(model, dataset, topk=[10, 20], device='cuda'):
+def evaluate_model(model, test_interactions, train_interactions, n_items, topk=[10, 20], device='cuda'):
     """
-    Performs full-ranking evaluation on the test dataset.
+    Performs full-ranking evaluation.
     model: Recommendation model (e.g. MatrixFactorization)
-    dataset: MINDDataset instance
+    test_interactions: dict mapping uid -> list of ground-truth item IDs
+    train_interactions: dict mapping uid -> list of training item IDs (to mask out)
+    n_items: total number of items
     """
     model.eval()
-    test_interactions, train_interactions = dataset.get_test_dataset()
-    all_item_ids = torch.arange(dataset.n_items, device=device)
-    
     overall_metrics = {k: {'recall': [], 'ndcg': []} for k in topk}
     
     # We evaluate sequentially per user to avoid OOM for huge datasets,
@@ -51,23 +50,27 @@ def evaluate_model(model, dataset, topk=[10, 20], device='cuda'):
         end_idx = min(start_idx + batch_size, len(users))
         batch_users = users[start_idx:end_idx]
         
-        # [Batch, N_items] user-item scores
-        batch_users_tensor = torch.tensor(batch_users, dtype=torch.long, device=device).unsqueeze(1) # [Batch, 1]
-        batch_items_tensor = all_item_ids.unsqueeze(0).expand(len(batch_users), -1) # [Batch, N_items]
-        
-        # To compute scores across all items efficiently, we can use model.get_embeddings
-        user_embs = model.get_embeddings(users=torch.tensor(batch_users, dtype=torch.long, device=device)) # [Batch, Dim]
-        item_embs = model.get_embeddings()[-1] # [N_items, Dim]
-        
-        # Scores: [Batch, N_items]
-        scores = torch.matmul(user_embs, item_embs.T)
+        user_tensor = torch.tensor(batch_users, dtype=torch.long, device=device)
+
+        # Fast path for MF-style models
+        if hasattr(model, "get_embeddings"):
+            user_embs = model.get_embeddings(users=user_tensor)  # [Batch, Dim]
+            item_embs = model.get_embeddings()[-1]               # [N_items, Dim]
+            scores = torch.matmul(user_embs, item_embs.T)        # [Batch, N_items]
+        # Fallback for models like MultiVAE
+        elif hasattr(model, "full_sort_predict"):
+            scores = model.full_sort_predict(user_tensor)
+            if scores.dim() == 1:
+                scores = scores.view(len(batch_users), -1)
+        else:
+            raise AttributeError("Model must provide get_embeddings() or full_sort_predict().")
         
         for i, u in enumerate(batch_users):
             u_ground_truth = test_interactions[u]
             if len(u_ground_truth) == 0:
                 continue
                 
-            u_train_items = train_interactions[u]
+            u_train_items = train_interactions.get(u, [])
             
             # Mask out training items
             scores[i, u_train_items] = -float('inf')
@@ -95,3 +98,4 @@ def evaluate_model(model, dataset, topk=[10, 20], device='cuda'):
 if __name__ == '__main__':
     # Test script usage
     pass
+ 

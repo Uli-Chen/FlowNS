@@ -101,6 +101,117 @@ class MINDDataset:
     def get_test_dataset(self):
         return self.test_interactions, self.train_interactions
 
+    def load_validation_data(self, val_dir):
+        """
+        Load validation set from a separate MINDsmall_dev directory.
+        Only maps users/items that already exist in the training vocabulary.
+        """
+        self.val_interactions = defaultdict(list)
+        behavior_file = os.path.join(val_dir, 'behaviors.tsv')
+        print(f"Loading validation data from {behavior_file}")
+        
+        df = pd.read_csv(behavior_file, sep='\t', header=None, 
+                         names=['imp_id', 'user_id', 'time', 'history', 'impressions'])
+        
+        val_user_clicks = defaultdict(set)
+        
+        for row in df.itertuples():
+            u = row.user_id
+            if u not in self.user2id:
+                continue  # Skip unknown users
+            uid = self.user2id[u]
+            
+            # Impressions: collect clicked items as validation positives
+            if pd.notna(row.impressions):
+                imps = row.impressions.split()
+                for imp in imps:
+                    item, click = imp.split('-')
+                    if click == '1' and item in self.item2id:
+                        iid = self.item2id[item]
+                        # Exclude items already in train to get true held-out positives
+                        if iid not in self.train_interactions.get(uid, []):
+                            val_user_clicks[uid].add(iid)
+        
+        for uid, items in val_user_clicks.items():
+            self.val_interactions[uid] = list(items)
+        
+        n_val_users = len(self.val_interactions)
+        n_val_pairs = sum(len(v) for v in self.val_interactions.values())
+        print(f"Validation set loaded: {n_val_users} users, {n_val_pairs} interactions.")
+    
+    def get_val_dataset(self):
+        """Returns (val_interactions, train_interactions) for evaluation."""
+        if not hasattr(self, 'val_interactions'):
+            raise RuntimeError("Validation data not loaded. Call load_validation_data() first.")
+        return self.val_interactions, self.train_interactions
+
+
+class ML100KDataset:
+    """MovieLens 100K dataset loader using ua.base/ua.test split."""
+    
+    def __init__(self, data_dir):
+        self.data_dir = data_dir
+        self.train_interactions = defaultdict(list)
+        self.test_interactions = defaultdict(list)
+        self.exposures = defaultdict(list)  # Empty, ml-100k has no exposure data
+        
+        self.n_users = 0
+        self.n_items = 0
+        
+        self.load_data()
+    
+    def load_data(self):
+        train_file = os.path.join(self.data_dir, 'ua.base')
+        test_file = os.path.join(self.data_dir, 'ua.test')
+        print(f"Loading ML-100K from {self.data_dir}")
+        
+        # Load train split
+        train_df = pd.read_csv(train_file, sep='\t', header=None,
+                               names=['user_id', 'item_id', 'rating', 'timestamp'])
+        # Load test split
+        test_df = pd.read_csv(test_file, sep='\t', header=None,
+                              names=['user_id', 'item_id', 'rating', 'timestamp'])
+        
+        # Collect all unique user/item IDs (1-indexed in ml-100k, remap to 0-indexed)
+        all_users = sorted(set(train_df['user_id'].tolist() + test_df['user_id'].tolist()))
+        all_items = sorted(set(train_df['item_id'].tolist() + test_df['item_id'].tolist()))
+        
+        user2id = {u: i for i, u in enumerate(all_users)}
+        item2id = {it: i for i, it in enumerate(all_items)}
+        
+        self.n_users = len(user2id)
+        self.n_items = len(item2id)
+        
+        # Build train interactions (implicit: all rated items are positive)
+        for row in train_df.itertuples():
+            uid = user2id[row.user_id]
+            iid = item2id[row.item_id]
+            self.train_interactions[uid].append(iid)
+        
+        # Deduplicate
+        for uid in self.train_interactions:
+            self.train_interactions[uid] = list(dict.fromkeys(self.train_interactions[uid]))
+        
+        # Build test interactions
+        for row in test_df.itertuples():
+            uid = user2id[row.user_id]
+            iid = item2id[row.item_id]
+            self.test_interactions[uid].append(iid)
+        
+        for uid in self.test_interactions:
+            self.test_interactions[uid] = list(dict.fromkeys(self.test_interactions[uid]))
+        
+        n_train = sum(len(v) for v in self.train_interactions.values())
+        n_test = sum(len(v) for v in self.test_interactions.values())
+        print(f"ML-100K loaded: {self.n_users} users, {self.n_items} items, "
+              f"{n_train} train / {n_test} test interactions.")
+    
+    def get_train_dataset(self, num_negatives=1):
+        return MFDataset(self.train_interactions, self.n_items, num_negatives)
+    
+    def get_test_dataset(self):
+        return self.test_interactions, self.train_interactions
+
 class MFDataset(Dataset):
     def __init__(self, user_interactions, n_items, num_negatives=1):
         self.user_interactions = user_interactions

@@ -1,0 +1,31 @@
+seed: 42
+model: sasrec
+device: auto
+show_progress: true
+output_path: results/sasrec_ml100k.json
+
+data:
+  data_path: dataset
+  dataset: ml-100k
+  min_rating: 1.0
+
+model_config:
+  max_seq_len: 50
+  embedding_dim: 64
+  num_heads: 2
+  num_layers: 2
+  dropout: 0.2
+
+training:
+  epochs: 20
+  batch_size: 256
+  learning_rate: 0.001
+  weight_decay: 0.000001
+
+evaluation:
+  topk: [10, 20]
+
+wandb:
+  enabled: false
+  project: flowns
+  mode: offline

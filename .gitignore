@@ -1,43 +1,30 @@
-# Data (too large for git)
+# Data and outputs
 data/raw/
 data/processed/
-exposure_cache/
 dataset/
-
-# Results and checkpoints
 results/
 saved/
+wandb/
 *.pth
-log/
-log_tensorboard/
 
-# Python
+# Python and uv
 __pycache__/
 *.pyc
 *.pyo
 *.egg-info/
+.pytest_cache/
+.ruff_cache/
+.uv-cache/
+.venv/
 dist/
 build/
 *.egg
 
-# IDE
-.vscode/
-.idea/
-
-# Misc
+# Logs and local tooling
 *.log
 *.lprof
-wandb/
+log/
+log_tensorboard/
 /ray_log*
-
-# RecBole fork (we use pip recbole; keep fork for reference only)
-recbole/
-run_recbole.py
-run_recbole_group.py
-run_hyper.py
-run_test.sh
-tests/
-run_example/
-docs/
-conda/
-asset/
+.vscode/
+.idea/

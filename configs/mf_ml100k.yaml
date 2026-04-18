@@ -1,0 +1,27 @@
+seed: 42
+model: mf
+device: auto
+show_progress: true
+output_path: results/mf_ml100k.json
+
+data:
+  data_path: dataset
+  dataset: ml-100k
+  min_rating: 1.0
+
+model_config:
+  embedding_dim: 64
+
+training:
+  epochs: 20
+  batch_size: 2048
+  learning_rate: 0.001
+  weight_decay: 0.000001
+
+evaluation:
+  topk: [10, 20]
+
+wandb:
+  enabled: false
+  project: flowns
+  mode: offline

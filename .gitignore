@@ -1,15 +1,43 @@
-# Saved models
-/saved*
-*.pth
+# Data (too large for git)
+data/raw/
+data/processed/
+exposure_cache/
+dataset/
 
+# Results and checkpoints
+results/
+saved/
+*.pth
+log/
+log_tensorboard/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# IDE
 .vscode/
 .idea/
-*.pyc
+
+# Misc
 *.log
-log_tensorboard
-saved/
 *.lprof
-*.egg-info/
-docs/build/
-wandb/*
+wandb/
 /ray_log*
+
+# RecBole fork (we use pip recbole; keep fork for reference only)
+recbole/
+run_recbole.py
+run_recbole_group.py
+run_hyper.py
+run_test.sh
+tests/
+run_example/
+docs/
+conda/
+asset/

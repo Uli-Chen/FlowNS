@@ -625,11 +625,16 @@ class Config(object):
     def compatibility_settings(self):
         import numpy as np
 
-        np.bool = np.bool_
-        np.int = np.int_
-        np.float = np.float_
-        np.complex = np.complex_
-        np.object = np.object_
-        np.str = np.str_
-        np.long = np.int_
-        np.unicode = np.unicode_
+        # NumPy 2.x removed these aliases; only set if missing
+        for attr, replacement in [
+            ("bool", np.bool_),
+            ("int", np.int_),
+            ("float", np.float64),
+            ("complex", np.complex128),
+            ("object", np.object_),
+            ("str", np.str_),
+            ("long", np.int_),
+            ("unicode", np.str_),
+        ]:
+            if not hasattr(np, attr):
+                setattr(np, attr, replacement)

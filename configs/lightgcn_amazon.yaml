@@ -1,0 +1,6 @@
+# LightGCN + Amazon-Books
+model: LightGCN
+dataset: amazon-books
+n_layers: 3
+reg_weight: 1.e-4
+require_pow: false

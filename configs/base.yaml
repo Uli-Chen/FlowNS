@@ -1,0 +1,40 @@
+# FlowNS base configuration
+# Shared across all datasets
+
+data_path: '../RecBole/dataset'
+embedding_size: 64
+
+# Evaluation
+metrics: ['Recall', 'NDCG', 'Hit']
+topk: [10, 20]
+valid_metric: 'NDCG@20'
+valid_metric_bigger: true
+eval_args:
+  split:
+    RS: [0.8, 0.1, 0.1]
+  mode: full
+  order: RO
+
+# Training
+learner: adam
+learning_rate: 0.001
+epochs: 1000
+train_batch_size: 20480
+eval_batch_size: 4096000
+stopping_step: 10
+eval_step: 1
+weight_decay: 0.0
+
+# Negative sampling
+train_neg_sample_args:
+  distribution: uniform
+  sample_num: 1
+
+# Misc
+seed: 2020
+reproducibility: true
+show_progress: true
+use_gpu: true
+
+# Checkpoint
+checkpoint_dir: 'saved/'

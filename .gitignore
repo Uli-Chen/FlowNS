@@ -1,0 +1,97 @@
+# --- Python ---
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Testing / typing / lint
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+*.ipynb_checkpoints/
+
+# --- Environment & secrets ---
+.env
+.env.*
+!.env.example
+
+# --- IDE / editor / local tooling ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.claude/
+
+# --- OS ---
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# --- ML training artifacts (regenerable) ---
+saved/
+log/
+log_tensorboard/
+results/
+
+# --- Large datasets (download / preprocess locally) ---
+data/MINDsmall_train/
+data/MINDsmall_dev/
+data/ml-100k/
+data/mind/mind.inter
+data/mind/mind.exposed_neg
+data/mind/mind.user2id.json
+data/mind/mind.item2id.json
+*.vec
+*.tsv
+*.tsv.gz
+*.zip
+
+# Keep dataset docs / instructions in repo
+!data/introduction.md
+
+# --- RecBole runtime (if created inside project) ---
+dataset/
+*.log
+
+# --- Misc ---
+*.tmp
+*.bak
+.cache/

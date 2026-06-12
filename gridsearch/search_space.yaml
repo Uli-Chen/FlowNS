@@ -1,0 +1,124 @@
+# Grid search for the "flow, no GRPO" setting across RecBole backbones on MIND.
+# Runner: python -m gridsearch.grid_search   (JSON reports -> gridsearch/reports/)
+#
+# Each run is a self-contained FlowNS pipeline with phases
+# [rec_pretrain, flow_pretrain, joint], GRPO disabled, trained from scratch
+# (use_paired_m0: false). RecBole defaults come from configs/experiments.yaml;
+# only the keys below override them. The grid searches lr, flow params, and
+# neg-sampling params, as requested.
+
+dataset: mind
+seed: 2020
+
+# Shared across all backbones (the "flow, no GRPO" protocol).
+base:
+  phases: [rec_pretrain, flow_pretrain, joint]
+  use_paired_m0: false
+  grpo_epochs: 0
+  joint_grpo_freq: 0
+  joint_grpo_steps: 0
+  evaluate_test: true
+  diagnostic_sample_users: 1000
+  # neg-sampling defaults (overridable per backbone / per grid)
+  negative_source: exposed
+  joint_num_negatives: 1
+  flow_neg_ratio: 1.0
+  mapping_topk: 100
+  boundary_safe_w: 0.5
+  # flow defaults
+  flow_pretrain_epochs: 200
+  flow_pretrain_batch_size: 256
+  sde_steps: 20
+
+# Backbones. Set `enabled: false` to skip. `experimental: true` only annotates
+# the report; the harness still attempts it and records any error.
+backbones:
+
+  BPR:                      # MF archetype
+    enabled: true
+    model: BPR
+    fixed:
+      epochs: 500
+      train_batch_size: 20480
+      eval_batch_size: 4096000
+      valid_metric: NDCG@10
+      eval_step: 5
+      stopping_step: 10
+      joint_rec_epochs: 200
+    grid:
+      learning_rate: [0.001, 0.0005]      # lr (rec pretrain)
+      joint_lr: [0.0001, 0.00005]         # lr (rec during joint)
+      flow_neg_ratio: [0.5, 1.0]          # neg-sampling: flow/random mix
+      mapping_strategy: [nearest, boundary_topk]   # neg-sampling: discretization
+
+  LightGCN:                 # GCN archetype
+    enabled: true
+    model: LightGCN
+    fixed:
+      epochs: 500
+      train_batch_size: 20480
+      eval_batch_size: 4096000
+      valid_metric: NDCG@10
+      eval_step: 5
+      stopping_step: 10
+      joint_rec_epochs: 200
+    grid:
+      learning_rate: [0.001, 0.0005]
+      joint_lr: [0.0001, 0.00005]
+      flow_neg_ratio: [0.5, 1.0]
+      mapping_strategy: [nearest, boundary_topk]
+
+  MultiVAE:                 # VAE archetype
+    enabled: true
+    model: MultiVAE
+    fixed:
+      epochs: 80
+      train_batch_size: 512
+      eval_batch_size: 409600
+      valid_metric: NDCG@20
+      eval_step: 1
+      stopping_step: 10
+      train_neg_sample_args: null
+      mlp_hidden_size: [600]
+      latent_dimension: 128
+      dropout_prob: 0.5
+      anneal_cap: 0.2
+      total_anneal_steps: 200000
+      flow_pretrain_epochs: 120
+      flow_pretrain_batch_size: 512
+      joint_rec_epochs: 40
+    grid:
+      learning_rate: [0.001, 0.0005]
+      joint_lr: [0.0001, 0.00005]
+      flow_neg_loss_weight: [0.1, 0.3]    # AE knob: weight on the flow-neg BPR penalty
+      mapping_strategy: [nearest, boundary_topk]
+
+  # Sequential transformer archetype. FlowNS has no static per-user representation
+  # for sequential models, and MIND here is a general (non-sequential) RecBole
+  # dataset, so this is expected to fail until a sequential pipeline + a user
+  # representation are added (see refine-logs/round-6). Left disabled; enable to
+  # record the gap in the report rather than silently dropping it.
+  SASRec:
+    enabled: false
+    experimental: true
+    model: SASRec
+    fixed:
+      epochs: 100
+      train_batch_size: 2048
+      eval_step: 5
+      stopping_step: 10
+      joint_rec_epochs: 100
+    grid:
+      learning_rate: [0.001]
+      joint_lr: [0.0001]
+      mapping_strategy: [nearest]
+
+# Extra params you can move into any `grid` block for the formal sweep, e.g.:
+#   flow_lr: [0.0001, 0.0005]
+#   flow_pretrain_epochs: [120, 300]
+#   eta: [0.3, 0.5]
+#   delta: [0.01, 0.05]
+#   negative_source: [exposed, random]
+#   boundary_safe_w: [0.4, 0.5, 0.6]
+#   mapping_topk: [50, 100, 200]
+#   joint_num_negatives: [1, 2]

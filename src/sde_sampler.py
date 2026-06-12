@@ -12,16 +12,45 @@ class SDESampler:
     Noise schedule: σ_t = η · √(1-t) / (√t + δ)
     """
 
-    def __init__(self, velocity_net, n_steps=20, eta=0.5, delta=0.01):
+    def __init__(self, velocity_net, n_steps=20, eta=0.5, delta=0.01,
+                 sigma_min=0.0, score_clamp=None):
+        """
+        Args:
+            sigma_min: floor on σ_t. The closed-form log-ratio and KL both divide by
+                2·σ_t²·Δt, which vanishes as t→1 and explodes any policy drift. A small
+                positive floor (e.g. 0.05) bounds that denominator. Default 0.0 keeps the
+                original (unfloored) behavior.
+            score_clamp: optional per-coordinate magnitude clamp on the Tweedie score
+                term -(x - t·v)/(1-t)², which is magnified ~1/(1-t)² near t→1 and feeds
+                both the drift and the KL. Default None disables clamping.
+        """
         self.velocity_net = velocity_net
         self.n_steps = n_steps
         self.eta = eta
         self.delta = delta
         self.dt = 1.0 / n_steps
+        self.sigma_min = float(sigma_min)
+        self.score_clamp = None if score_clamp is None else float(score_clamp)
+        self.score_eps = 1e-6
 
     def noise_schedule(self, t):
-        """σ_t = η · √(1-t) / (√t + δ)"""
-        return self.eta * torch.sqrt(1 - t) / (torch.sqrt(t) + self.delta)
+        """σ_t = max(η · √(1-t) / (√t + δ), σ_min)"""
+        sigma = self.eta * torch.sqrt(1 - t) / (torch.sqrt(t) + self.delta)
+        if self.sigma_min > 0.0:
+            sigma = sigma.clamp_min(self.sigma_min)
+        return sigma
+
+    def _tweedie_score(self, x, v, t_val):
+        """∇log p_t ≈ -(x - t·v)/(1-t)², floored and optionally magnitude-clamped.
+
+        Keeps gradients flowing through v. t_val is a python float.
+        """
+        if t_val <= 1e-6:
+            return torch.zeros_like(x)
+        score = -(x - t_val * v) / max((1 - t_val) ** 2, self.score_eps)
+        if self.score_clamp is not None:
+            score = score.clamp(-self.score_clamp, self.score_clamp)
+        return score
 
     @torch.no_grad()
     def sample_trajectories(self, user_emb, n_trajectories=8):
@@ -52,11 +81,7 @@ class SDESampler:
             v = self.velocity_net(x, u_exp, t)
 
             # Tweedie score approximation
-            t_scalar = t_val
-            if t_scalar > 1e-6:
-                score = -(x - t_scalar * v) / max((1 - t_scalar) ** 2, 1e-6)
-            else:
-                score = torch.zeros_like(x)
+            score = self._tweedie_score(x, v, t_val)
 
             drift = v + 0.5 * sigma_t ** 2 * score
             eps = torch.randn_like(x)
@@ -86,11 +111,7 @@ class SDESampler:
 
             v = self.velocity_net(x, u_exp, t)
 
-            t_scalar = t_val
-            if t_scalar > 1e-6:
-                score = -(x - t_scalar * v) / max((1 - t_scalar) ** 2, 1e-6)
-            else:
-                score = torch.zeros_like(x)
+            score = self._tweedie_score(x, v, t_val)
 
             drift = v + 0.5 * sigma_t ** 2 * score
             eps = torch.randn_like(x)
@@ -132,17 +153,11 @@ class SDESampler:
 
             with torch.no_grad():
                 v_old = velocity_net_old(x_t, u_exp, t)
-                if t_val > 1e-6:
-                    score_old = -(x_t - t_val * v_old) / max((1 - t_val) ** 2, 1e-6)
-                else:
-                    score_old = torch.zeros_like(x_t)
+                score_old = self._tweedie_score(x_t, v_old, t_val)
                 drift_old = v_old + 0.5 * sigma_t ** 2 * score_old
 
             v_new = self.velocity_net(x_t, u_exp, t)
-            if t_val > 1e-6:
-                score_new = -(x_t - t_val * v_new) / max((1 - t_val) ** 2, 1e-6)
-            else:
-                score_new = torch.zeros_like(x_t)
+            score_new = self._tweedie_score(x_t, v_new, t_val)
             drift_new = v_new + 0.5 * sigma_t ** 2 * score_new
 
             diff_old = (dx - drift_old * self.dt).pow(2).sum(dim=-1)
@@ -181,12 +196,8 @@ class SDESampler:
                 v_ref = velocity_net_ref(x_t, u_exp, t)
 
             # Full drift including score term
-            if t_val > 1e-6:
-                score_theta = -(x_t - t_val * v_theta) / max((1 - t_val) ** 2, 1e-6)
-                score_ref = -(x_t.detach() - t_val * v_ref) / max((1 - t_val) ** 2, 1e-6)
-            else:
-                score_theta = torch.zeros_like(x_t)
-                score_ref = torch.zeros_like(x_t)
+            score_theta = self._tweedie_score(x_t, v_theta, t_val)
+            score_ref = self._tweedie_score(x_t.detach(), v_ref, t_val)
 
             drift_theta = v_theta + 0.5 * sigma_t ** 2 * score_theta
             drift_ref = v_ref + 0.5 * sigma_t ** 2 * score_ref

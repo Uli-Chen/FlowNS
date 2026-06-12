@@ -1,4 +1,5 @@
 import random
+import time
 
 import torch
 import torch.nn as nn
@@ -103,13 +104,16 @@ class ConditionalFlowModel:
         return loss
 
     def pretrain(self, user_emb_all, item_emb_all, user_pos_items,
-                 epochs=50, batch_size=256, lr=1e-4):
-        """Phase 1: Pretrain flow model with CFM loss.
+                 user_neg_items=None,
+                 epochs=50, batch_size=256, lr=1e-4, log_interval=10,
+                 stopping_step=0):
+        """Pretrain flow model with CFM loss.
 
         Args:
             user_emb_all: (n_users, d) all user embeddings
             item_emb_all: (n_items, d) all item embeddings
             user_pos_items: dict {uid: set(item_ids)}
+            user_neg_items: optional dict {uid: list(item_ids)} for explicit negatives
             epochs: training epochs
             batch_size: batch size
             lr: learning rate
@@ -119,8 +123,24 @@ class ConditionalFlowModel:
 
         n_items = item_emb_all.shape[0]
         user_ids = [uid for uid in user_pos_items if uid < user_emb_all.shape[0]]
+        n_batches_total = (len(user_ids) + batch_size - 1) // batch_size
+
+        logger.info(
+            'Flow pretrain started: users=%d, items=%d, emb_dim=%d, '
+            'epochs=%d, batch_size=%d, batches/epoch=%d, lr=%s, '
+            'explicit_neg_users=%d',
+            len(user_ids), n_items, self.emb_dim, epochs, batch_size,
+            n_batches_total, lr,
+            sum(1 for uid in user_ids if user_neg_items and user_neg_items.get(uid)),
+        )
+
+        best_loss = float('inf')
+        best_state = None
+        best_epoch = -1
+        patience = 0
 
         for epoch in range(epochs):
+            epoch_start = time.time()
             total_loss = 0.0
             n_batches = 0
 
@@ -134,10 +154,14 @@ class ConditionalFlowModel:
                 neg_ids = []
                 for uid in batch_uids:
                     pos = user_pos_items.get(uid, set())
-                    while True:
-                        nid = random.randint(1, n_items - 1)
-                        if nid not in pos:
-                            break
+                    neg_pool = user_neg_items.get(uid) if user_neg_items else None
+                    if neg_pool:
+                        nid = random.choice(neg_pool)
+                    else:
+                        while True:
+                            nid = random.randint(1, n_items - 1)
+                            if nid not in pos:
+                                break
                     neg_ids.append(nid)
                 neg_emb = item_emb_all[neg_ids]
 
@@ -150,8 +174,43 @@ class ConditionalFlowModel:
                 n_batches += 1
 
             avg_loss = total_loss / max(n_batches, 1)
-            if (epoch + 1) % 10 == 0 or epoch == 0:
-                logger.info(f'Flow pretrain epoch {epoch+1}/{epochs}, loss={avg_loss:.6f}')
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                best_epoch = epoch + 1
+                best_state = {
+                    k: v.clone() for k, v in self.velocity_net.state_dict().items()
+                }
+                patience = 0
+            else:
+                patience += 1
 
+            should_log = (
+                epoch == 0
+                or epoch + 1 == epochs
+                or (log_interval and (epoch + 1) % log_interval == 0)
+            )
+            if should_log:
+                logger.info(
+                    'Flow pretrain epoch %d/%d: loss=%.6f, best=%.6f@%d, '
+                    'patience=%d/%d, batches=%d, time=%.2fs',
+                    epoch + 1, epochs, avg_loss, best_loss, best_epoch,
+                    patience, stopping_step or 0,
+                    n_batches, time.time() - epoch_start,
+                )
+
+            if stopping_step and patience >= stopping_step:
+                logger.info(
+                    'Flow pretrain early stopping at epoch %d '
+                    '(no improvement for %d epochs).',
+                    epoch + 1, stopping_step,
+                )
+                break
+
+        if best_state is not None:
+            self.velocity_net.load_state_dict(best_state)
+            logger.info(
+                'Flow pretrain: restored best checkpoint from epoch %d (loss=%.6f).',
+                best_epoch, best_loss,
+            )
         self.save_as_reference()
-        logger.info('Flow pretrain complete. Reference policy saved.')
+        logger.info('Flow pretrain complete: reference policy saved.')

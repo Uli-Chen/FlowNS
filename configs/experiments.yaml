@@ -1,0 +1,271 @@
+# FlowNS experiment definitions
+# All experiments share `defaults`; each experiment only overrides what differs.
+#
+# 2026-06-09 cleanup: pruned to the M0/M1/M2 trunk + core controls.
+# The exploratory M2c-M2af variants and the M3/M4/M5 ablations were removed.
+# Rationale and a failure post-mortem are in
+# refine-logs/round-8-cleanup-and-reflection.md.
+#
+# Trunk (two backbones):
+#   LightGCN:  M0_baseline -> M1_flow_pretrain -> M2_flowns_full -> M2b_flow_no_grpo
+#   MultiVAE:  M0_multivae_baseline -> M2_multivae_flow_no_grpo (+ M2_multivae_random_neg_control)
+
+# RecBole Phase 1 training parameters (passed to RecBole Config).
+# Dataset configs (e.g. lightgcn_mind.yaml) override these values.
+recbole:
+  data_path: ../RecBole/dataset
+  embedding_size: 64
+  metrics: [Recall, NDCG, Hit, MRR]
+  topk: [10, 20]
+  valid_metric: NDCG@10
+  valid_metric_bigger: true
+  eval_args:
+    split:
+      RS: [0.8, 0.1, 0.1]
+    mode: full
+    order: RO
+  learner: adam
+  learning_rate: 0.001
+  epochs: 500
+  train_batch_size: 20480
+  eval_batch_size: 4096000
+  eval_step: 1
+  weight_decay: 0.0
+  train_neg_sample_args:
+    distribution: uniform
+    sample_num: 1
+  seed: 2020
+  reproducibility: true
+  show_progress: true
+  use_gpu: true
+  checkpoint_dir: saved/
+
+# FlowNS Phases 2-4 defaults (passed to FlowNSTrainer).
+defaults:
+  # Flow model architecture
+  flow_hidden_dim: 256
+  flow_n_layers: 3
+
+  # Phase 2: Flow CFM pretraining
+  flow_pretrain_epochs: 500
+  flow_pretrain_batch_size: 256
+  flow_lr: 1.e-4
+  flow_log_interval: 10
+  flow_checkpoint_path:
+  flow_ref_checkpoint_path:
+
+  # SDE sampler
+  sde_steps: 20
+  eta: 0.5
+  delta: 0.01
+  # Numerical-stability knobs for the closed-form GRPO log-ratio/KL (Round 8 §5.B).
+  # Defaults preserve the original behavior; set sigma_min>0 / score_clamp>0 to
+  # bound the 2*sigma^2*dt denominator and the 1/(1-t)^2 score term near t->1.
+  sde_sigma_min: 0.0
+  sde_score_clamp:
+
+  # Phase 3: GRPO fine-tuning
+  grpo_epochs: 10
+  grpo_group_size: 8
+  grpo_clip_eps: 0.2
+  grpo_beta: 0.1
+  grpo_lr: 1.e-4
+  grpo_batch_size: 64
+  grpo_log_interval: 1
+  grpo_old_policy_scope: batch
+  grpo_normalize_log_ratio: false
+  grpo_reward_mode: mapped_item
+
+  # Reward
+  reward_a: 1.0
+  reward_gamma: 1.0
+
+  # Phase 4: Joint training
+  joint_rec_epochs: 100
+  joint_grpo_freq: 5
+  joint_grpo_steps: 2
+  joint_num_negatives: 1
+  joint_exposed_neg_ratio: 0.0
+  eval_step: 1
+  stopping_step: 10
+  max_pos_samples: 10
+  mapping_strategy: nearest
+  mapping_topk: 50
+  # boundary_topk: among the top-k nearest candidates, drop those that beat the
+  # user's positives with win-rate > boundary_safe_w (likely false negatives),
+  # then keep the hardest still-safe one (Round 10 bridge fix).
+  boundary_safe_w: 0.5
+  mapper_chunk_size: 16384
+  negative_source: random
+  rerank_num_negatives: 0
+  rerank_neg_penalty: 0.0
+  rerank_mapping_strategy: nearest
+  rerank_mapping_topk: 50
+  rerank_score_mode: mapped_item
+  rerank_candidate_topk: 50
+  eval_exposed_neg_penalty: 0.0
+
+  # Evaluation
+  evaluate_test: true
+  diagnostic_sample_users: 1000
+
+experiments:
+  # === M0: recommender baselines (the controls everything is compared to) ===
+  M0_baseline:
+    description: LightGCN baseline with uniform RecBole negative sampling.
+    phases: [rec_pretrain]
+    save_rec_checkpoint_pointer: true
+
+  M0_multivae_baseline:
+    description: MultiVAE baseline for testing FlowNS in an autoencoder latent/logit space.
+    model: MultiVAE
+    phases: [rec_pretrain]
+    save_rec_checkpoint_pointer: true
+    valid_metric: NDCG@20
+    epochs: 80
+    stopping_step: 10
+    train_batch_size: 512
+    eval_batch_size: 409600
+    train_neg_sample_args:
+    mlp_hidden_size: [600]
+    latent_dimension: 128
+    dropout_prob: 0.5
+    anneal_cap: 0.2
+    total_anneal_steps: 200000
+
+  # === M1: flow CFM pretraining + generation-quality (realness) check ===
+  M1_flow_pretrain:
+    description: RecBole pretrain + standalone flow CFM pretraining + generation check.
+    phases: [rec_pretrain, flow_pretrain]
+    evaluate_test: false
+    quality_check: true
+    quality_sample_users: 1000
+    save_flow_model: true
+
+  # === M2: full FlowNS on LightGCN + its no-GRPO control ===
+  # NOTE: M2/M2b use the default negative_source=random, so the flow CFM target
+  # is random non-positive items, not MIND exposed negatives. This is the
+  # "uniform-negative-as-flow" instantiation; the exposed-negative (proposal)
+  # design lives in the MultiVAE M2_multivae_flow_no_grpo line below.
+  M2_flowns_full:
+    description: Full FlowNS pipeline (flow pretrain + GRPO + joint) from paired M0 checkpoint.
+    phases: [rec_pretrain, flow_pretrain, grpo, joint]
+    use_paired_m0: true
+
+  M2b_flow_no_grpo:
+    description: Paired M0 + flow negatives, without GRPO updates. Isolates the GRPO contribution.
+    phases: [rec_pretrain, flow_pretrain, joint]
+    use_paired_m0: true
+    grpo_epochs: 0
+    joint_rec_epochs: 500
+    joint_grpo_freq: 0
+    joint_grpo_steps: 0
+    eval_step: 1
+    stopping_step: 20
+
+  # === MultiVAE trunk: exposed-flow negatives + random-negative control ===
+  M2_multivae_flow_no_grpo:
+    description: MultiVAE paired M0 + exposed-flow negatives, no GRPO.
+    model: MultiVAE
+    phases: [rec_pretrain, flow_pretrain, joint]
+    use_paired_m0: true
+    negative_source: exposed
+    valid_metric: NDCG@20
+    epochs: 80
+    train_batch_size: 512
+    eval_batch_size: 409600
+    train_neg_sample_args:
+    mlp_hidden_size: [600]
+    latent_dimension: 128
+    dropout_prob: 0.5
+    anneal_cap: 0.2
+    total_anneal_steps: 200000
+    flow_pretrain_epochs: 120
+    flow_pretrain_batch_size: 512
+    flow_checkpoint_path: results/pilot/M2_multivae_flow_no_grpo_flow.pt
+    flow_ref_checkpoint_path: results/pilot/M2_multivae_flow_no_grpo_flow_ref.pt
+    grpo_epochs: 0
+    joint_rec_epochs: 40
+    joint_grpo_freq: 0
+    joint_grpo_steps: 0
+    joint_num_negatives: 1
+    flow_neg_ratio: 1.0
+    flow_neg_loss_weight: 0.1
+    joint_lr: 1.e-4
+    mapping_strategy: nearest
+    eval_exposed_neg_penalty: 0.0
+    eval_step: 1
+    stopping_step: 10
+
+  M2_multivae_random_neg_control:
+    description: MultiVAE paired M0 + random sampled-negative BPR penalty, no flow and no GRPO.
+    model: MultiVAE
+    phases: [rec_pretrain, joint]
+    use_paired_m0: true
+    use_random_neg: true
+    valid_metric: NDCG@20
+    epochs: 80
+    train_batch_size: 512
+    eval_batch_size: 409600
+    train_neg_sample_args:
+    mlp_hidden_size: [600]
+    latent_dimension: 128
+    dropout_prob: 0.5
+    anneal_cap: 0.2
+    total_anneal_steps: 200000
+    grpo_epochs: 0
+    joint_rec_epochs: 40
+    joint_grpo_freq: 0
+    joint_grpo_steps: 0
+    joint_num_negatives: 1
+    flow_neg_loss_weight: 0.1
+    joint_lr: 1.e-4
+    eval_step: 1
+    stopping_step: 10
+
+  # === Round 10 experimental arm: continuous->discrete bridge fix ===
+  # Post-fix evidence (round-9): on MIND/MultiVAE, exposed-flow with `nearest`
+  # mapping gives +0% (M2vae=baseline) while a random-neg BPR penalty gives +2.2%
+  # (M2vaeR). nearest collapses flow hardness (W_mapped~0.20) so flow negatives are
+  # too easy to produce a BPR gradient. boundary_topk keeps the hardest candidate
+  # that is still a safe (non-false-negative) real negative. Reuses the cached flow,
+  # so only the mapping differs from M2_multivae_flow_no_grpo.
+  M2vae_boundary:
+    description: MultiVAE exposed-flow + boundary_topk hardness-preserving FN-safe mapping, no GRPO.
+    model: MultiVAE
+    phases: [rec_pretrain, flow_pretrain, joint]
+    use_paired_m0: true
+    negative_source: exposed
+    valid_metric: NDCG@20
+    epochs: 80
+    train_batch_size: 512
+    eval_batch_size: 409600
+    train_neg_sample_args:
+    mlp_hidden_size: [600]
+    latent_dimension: 128
+    dropout_prob: 0.5
+    anneal_cap: 0.2
+    total_anneal_steps: 200000
+    flow_pretrain_epochs: 120
+    flow_pretrain_batch_size: 512
+    flow_checkpoint_path: results/pilot/M2_multivae_flow_no_grpo_flow.pt
+    flow_ref_checkpoint_path: results/pilot/M2_multivae_flow_no_grpo_flow_ref.pt
+    grpo_epochs: 0
+    joint_rec_epochs: 40
+    joint_grpo_freq: 0
+    joint_grpo_steps: 0
+    joint_num_negatives: 1
+    flow_neg_ratio: 1.0
+    flow_neg_loss_weight: 0.1
+    joint_lr: 1.e-4
+    mapping_strategy: boundary_topk
+    mapping_topk: 100
+    boundary_safe_w: 0.5
+    # a>gamma puts the reward peak (W*=a/(a+gamma)=0.667) above the safety cap, so on
+    # the safe region [0, 0.5] the reward is monotonic increasing -> boundary_topk
+    # selects the hardest candidate that is still a safe (non-false-negative) negative.
+    reward_a: 2.0
+    reward_gamma: 1.0
+    eval_exposed_neg_penalty: 0.0
+    eval_step: 1
+    stopping_step: 10

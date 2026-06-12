@@ -8,8 +8,3 @@ require_pow: false
 # MIND-specific: smaller batch due to larger user/item space
 train_batch_size: 20480
 eval_batch_size: 4096000
-embedding_size: 64
-learning_rate: 0.001
-epochs: 1000
-stopping_step: 20
-eval_step: 1

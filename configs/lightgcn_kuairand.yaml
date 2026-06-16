@@ -1,0 +1,33 @@
+# LightGCN + KuaiRand-1K (exposure dataset, second testbed alongside MIND)
+#
+# Built by scripts/preprocess_kuairand.py (coarse pre-filter --min-item-inter 10):
+# short-video impression logs where is_click==1 is a positive interaction and
+# is_click==0 is a *true* exposed negative (data/kuairand/kuairand.exposed_neg),
+# mirroring MIND. The canonical iterative 10-core (users & items) is applied below.
+#
+# Shape after 10-core: 995 users x 68,378 items, 1,318,588 positives,
+# 1,028,579 usable exposed negs, density 1.94% — abundant exposed negatives and
+# the dynamic range MIND lacked for a negative-sampling contribution.
+model: LightGCN
+dataset: kuairand
+n_layers: 3
+reg_weight: 1.e-4
+require_pow: false
+
+# Atomic-file fields (timestamp kept as float so temporal split is possible;
+# experiments.yaml uses RO split, so it is loaded but inert by default).
+TIME_FIELD: timestamp
+load_col:
+  inter: [user_id, item_id, timestamp]
+
+# Canonical iterative 10-core on BOTH users and items (RecBole loops until every
+# surviving user and item has >= 10 interactions). The preprocessing item
+# pre-filter (>=10 raw positives) is lossless for this core, so the binding
+# filter is here. Exposed negatives referencing cored-out items/users are
+# dropped automatically by the loader's token2id lookup.
+user_inter_num_interval: "[10,inf)"
+item_inter_num_interval: "[10,inf)"
+
+# Few users (992) but a large item catalogue; batch sizes mirror lightgcn_mind.
+train_batch_size: 20480
+eval_batch_size: 4096000

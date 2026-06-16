@@ -1,3 +1,5 @@
+import math
+
 import torch
 import logging
 
@@ -8,8 +10,17 @@ class SDESampler:
     """ODE-to-SDE conversion + Euler-Maruyama sampling for flow model.
 
     dx_t = [v_θ + (σ_t²/2)·∇log p_t] dt + σ_t dw
-    Tweedie score: ∇log p_t ≈ -(x_t - t·v_θ) / (1-t)²
+    Tweedie score: ∇log p_t = -(x_t - t·E[x_1|x_t]) / (1-t)². Under the linear
+    CFM path, E[x_1|x_t] = x_t + (1-t)·v_θ, which simplifies to
+    ∇log p_t ≈ -(x_t - t·v_θ) / (1-t).
     Noise schedule: σ_t = η · √(1-t) / (√t + δ)
+
+    Discretization uses the exact per-step average of σ_s² over [t, t+Δt]
+    (closed form below) instead of the left-endpoint value: σ_0 = η/δ is huge
+    (50 with the defaults) and σ_0²·Δt would inject ~125 units of variance in
+    the first Euler-Maruyama step, even though ∫σ_s²ds over that step is O(1).
+    The same per-step σ̄ is used in sampling, log-ratio, and KL so the Gaussian
+    transition densities stay mutually consistent.
     """
 
     def __init__(self, velocity_net, n_steps=20, eta=0.5, delta=0.01,
@@ -21,7 +32,7 @@ class SDESampler:
                 positive floor (e.g. 0.05) bounds that denominator. Default 0.0 keeps the
                 original (unfloored) behavior.
             score_clamp: optional per-coordinate magnitude clamp on the Tweedie score
-                term -(x - t·v)/(1-t)², which is magnified ~1/(1-t)² near t→1 and feeds
+                term -(x - t·v)/(1-t), which is magnified ~1/(1-t) near t→1 and feeds
                 both the drift and the KL. Default None disables clamping.
         """
         self.velocity_net = velocity_net
@@ -40,14 +51,48 @@ class SDESampler:
             sigma = sigma.clamp_min(self.sigma_min)
         return sigma
 
+    def _sigma_sq_integral(self, a, b):
+        """Exact ∫_a^b σ_s² ds = η²·[F(√b) - F(√a)] for the η,δ schedule.
+
+        With u = √s, w = u + δ:
+        F(u) = -w² + 6δw + 2(1-3δ²)·ln(w) + 2(δ-δ³)/w.
+        Pinned against numeric quadrature in tests/test_p0_fixes.py.
+        """
+        d = self.delta
+
+        def F(u):
+            w = u + d
+            return (
+                -w * w + 6.0 * d * w
+                + 2.0 * (1.0 - 3.0 * d * d) * math.log(w)
+                + 2.0 * (d - d ** 3) / w
+            )
+
+        return (self.eta ** 2) * (F(math.sqrt(b)) - F(math.sqrt(a)))
+
+    def step_sigma(self, step):
+        """√ of the average σ_s² over the Euler-Maruyama step [t, t+Δt]."""
+        t0 = step * self.dt
+        t1 = min(t0 + self.dt, 1.0)
+        var = self._sigma_sq_integral(t0, t1) / self.dt
+        sigma = math.sqrt(max(var, 0.0))
+        if self.sigma_min > 0.0:
+            sigma = max(sigma, self.sigma_min)
+        return sigma
+
     def _tweedie_score(self, x, v, t_val):
-        """∇log p_t ≈ -(x - t·v)/(1-t)², floored and optionally magnitude-clamped.
+        """∇log p_t ≈ -(x - t·v)/(1-t), floored and optionally magnitude-clamped.
+
+        Tweedie gives ∇log p_t = -(x - t·E[x_1|x])/(1-t)². With the linear CFM
+        path, v = E[x_1 - x_0|x] implies E[x_1|x] = x + (1-t)·v, so the
+        numerator carries a (1-t) factor and the denominator is first order:
+        x - t·E[x_1|x] = (1-t)·(x - t·v). At t=0 this is just -x, the standard
+        normal score, so no special case is needed. Verified against the
+        closed-form Gaussian score in tests/test_p0_fixes.py.
 
         Keeps gradients flowing through v. t_val is a python float.
         """
-        if t_val <= 1e-6:
-            return torch.zeros_like(x)
-        score = -(x - t_val * v) / max((1 - t_val) ** 2, self.score_eps)
+        score = -(x - t_val * v) / max(1 - t_val, self.score_eps)
         if self.score_clamp is not None:
             score = score.clamp(-self.score_clamp, self.score_clamp)
         return score
@@ -76,7 +121,7 @@ class SDESampler:
         for step in range(self.n_steps):
             t_val = step * self.dt
             t = torch.full((B * G,), t_val, device=user_emb.device)
-            sigma_t = self.noise_schedule(t[0:1]).item()
+            sigma_t = self.step_sigma(step)
 
             v = self.velocity_net(x, u_exp, t)
 
@@ -107,7 +152,7 @@ class SDESampler:
         for step in range(self.n_steps):
             t_val = step * self.dt
             t = torch.full((B * G,), t_val, device=user_emb.device)
-            sigma_t = self.noise_schedule(t[0:1]).item()
+            sigma_t = self.step_sigma(step)
 
             v = self.velocity_net(x, u_exp, t)
 
@@ -145,7 +190,7 @@ class SDESampler:
         for step in range(T):
             t_val = step * self.dt
             t = torch.full((B * G,), t_val, device=user_emb.device)
-            sigma_t = self.noise_schedule(t[0:1]).item()
+            sigma_t = self.step_sigma(step)
 
             x_t = trajectories[step].reshape(B * G, d)
             x_next = trajectories[step + 1].reshape(B * G, d)
@@ -187,7 +232,7 @@ class SDESampler:
         for step in range(T):
             t_val = step * self.dt
             t = torch.full((B * G,), t_val, device=user_emb.device)
-            sigma_t = self.noise_schedule(t[0:1]).item()
+            sigma_t = self.step_sigma(step)
 
             x_t = trajectories[step].reshape(B * G, d)
 

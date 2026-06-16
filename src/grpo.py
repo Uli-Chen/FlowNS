@@ -29,7 +29,7 @@ class GRPOTrainer:
                  max_pos_samples=10, log_interval=1,
                  old_policy_scope='batch', normalize_log_ratio=False,
                  reward_mode='mapped_item', mapping_strategy='nearest',
-                 mapping_topk=50, boundary_safe_w=0.5):
+                 mapping_topk=50, boundary_safe_w=0.5, soft_reward_tau=0.1):
         self.flow_model = flow_model
         self.sde_sampler = sde_sampler
         self.reward_fn = reward_fn
@@ -42,9 +42,12 @@ class GRPOTrainer:
         self.log_interval = log_interval
         if old_policy_scope not in {'batch', 'epoch'}:
             raise ValueError('old_policy_scope must be "batch" or "epoch"')
-        if reward_mode not in {'continuous', 'mapped_item', 'score_topk'}:
+        if reward_mode not in {
+            'continuous', 'mapped_item', 'score_topk', 'soft_topk',
+        }:
             raise ValueError(
-                'reward_mode must be "continuous", "mapped_item", or "score_topk"'
+                'reward_mode must be "continuous", "mapped_item", '
+                '"score_topk", or "soft_topk"'
             )
         self.old_policy_scope = old_policy_scope
         self.normalize_log_ratio = normalize_log_ratio
@@ -52,11 +55,16 @@ class GRPOTrainer:
         self.mapping_strategy = mapping_strategy
         self.mapping_topk = mapping_topk
         self.boundary_safe_w = boundary_safe_w
+        self.soft_reward_tau = float(soft_reward_tau)
         self.optimizer = optim.Adam(
             flow_model.velocity_net.parameters(), lr=lr
         )
         self._ref_net = None
         self._old_state = None
+        # Per-epoch (phase 3) / per-step (phase 4) stat history, exported to the
+        # result JSON so the D1 gate (reward trend, KL, ratio health) can be
+        # checked offline without parsing logs.
+        self.history = []
 
     def _ensure_ref_net(self):
         if self._ref_net is None:
@@ -87,7 +95,7 @@ class GRPOTrainer:
             user_pos_items: dict {uid: set(item_ids)}
         Returns:
             pos_embs: (B, K, d) padded positive embeddings
-            K: number of positive samples per user (capped)
+            pos_mask: (B, K) bool, True at real (non-padded) positives
         """
         K = self.max_pos_samples
         B = len(user_ids)
@@ -95,6 +103,7 @@ class GRPOTrainer:
         device = item_emb_all.device
 
         pos_embs = torch.zeros(B, K, d, device=device)
+        pos_mask = torch.zeros(B, K, dtype=torch.bool, device=device)
         for i, uid in enumerate(user_ids):
             pos_ids = list(user_pos_items.get(uid, []))
             if not pos_ids:
@@ -103,12 +112,13 @@ class GRPOTrainer:
                 indices = torch.randperm(len(pos_ids))[:K]
                 pos_ids = [pos_ids[j] for j in indices]
             pos_embs[i, :len(pos_ids)] = item_emb_all[pos_ids]
+            pos_mask[i, :len(pos_ids)] = True
 
-        return pos_embs
+        return pos_embs, pos_mask
 
     @torch.no_grad()
     def _reward_embs(self, final_emb, user_emb, user_ids, item_emb_all,
-                     user_pos_items, pos_embs):
+                     user_pos_items, pos_embs, pos_mask):
         """Return embeddings used by the reward.
 
         The recommender is trained with discrete item IDs after nearest-neighbor
@@ -149,6 +159,9 @@ class GRPOTrainer:
         flat_pos = pos_embs.unsqueeze(1).expand(
             B, G, pos_embs.shape[1], d,
         ).reshape(B * G, pos_embs.shape[1], d)
+        flat_mask = pos_mask.unsqueeze(1).expand(
+            B, G, pos_mask.shape[1],
+        ).reshape(B * G, pos_mask.shape[1])
         forbidden = []
         for uid in user_ids:
             ids = user_pos_items.get(uid, set())
@@ -160,12 +173,72 @@ class GRPOTrainer:
             exclude_item_ids=(0,),
             user_emb=flat_user,
             pos_item_embs=flat_pos,
+            pos_mask=flat_mask,
             reward_fn=self.reward_fn,
             strategy=self.mapping_strategy,
             candidate_topk=self.mapping_topk,
             boundary_safe_w=self.boundary_safe_w,
         ).reshape(B, G)
         return item_emb_all[mapped_ids]
+
+    @torch.no_grad()
+    def _soft_topk_rewards(self, final_emb, user_emb, user_ids, item_emb_all,
+                           user_pos_items, pos_embs, pos_mask):
+        """Soft expected reward over the top-k mapped candidates.
+
+        R_soft(x_1) = Σ_{j∈topk(x_1)} p(j|x_1)·R(W_j), p(j|x_1) ∝ exp(sim/τ).
+
+        The hard argmax mapping makes the reward piecewise-constant in x_1, so
+        group advantages mostly carry discretization noise. The soft expectation
+        restores a smooth signal while staying inside the discrete-item reward:
+        R_soft is a convex combination of R(W_j) ≤ R_max, so the FN bound that
+        relies on R ≤ R_max is unchanged.
+
+        Returns:
+            rewards: (B, G)
+            win_rates: (B, G) probability-weighted candidate win rates
+        """
+        B, G, d = final_emb.shape
+        k = min(max(int(self.mapping_topk), 1), item_emb_all.shape[0])
+        flat = final_emb.reshape(B * G, d)
+
+        sim = self.mapper.gen_item_similarity(flat)  # (B*G, n_items)
+        n_items = sim.shape[1]
+        sim[:, 0] = -torch.inf
+        for row, uid in enumerate(user_ids):
+            ids = user_pos_items.get(uid, set())
+            if not ids:
+                continue
+            ids = torch.as_tensor(
+                list(ids), device=sim.device, dtype=torch.long,
+            )
+            ids = ids[(ids >= 0) & (ids < n_items)]
+            if ids.numel() > 0:
+                sim[row * G:(row + 1) * G, ids] = -torch.inf
+
+        cand_sim, cand_ids = sim.topk(k=k, dim=-1)  # (B*G, k)
+        cand_emb = item_emb_all[cand_ids]  # (B*G, k, d)
+
+        flat_user = user_emb.unsqueeze(1).expand(B, G, d).reshape(B * G, d)
+        cand_scores = (cand_emb * flat_user.unsqueeze(1)).sum(dim=-1)  # (B*G, k)
+        score_pos = (
+            user_emb.unsqueeze(1) * pos_embs
+        ).sum(dim=-1)  # (B, K)
+        score_pos = score_pos.unsqueeze(1).expand(
+            B, G, score_pos.shape[1],
+        ).reshape(B * G, 1, -1)  # (B*G, 1, K)
+        mask = pos_mask.unsqueeze(1).expand(
+            B, G, pos_mask.shape[1],
+        ).reshape(B * G, 1, -1).to(cand_scores.dtype)  # (B*G, 1, K)
+
+        wins = torch.sigmoid(cand_scores.unsqueeze(-1) - score_pos)  # (B*G, k, K)
+        W_cand = (wins * mask).sum(dim=-1) / mask.sum(dim=-1).clamp_min(1.0)
+        R_cand = self.reward_fn.compute_reward(W_cand)  # (B*G, k)
+
+        probs = F.softmax(cand_sim / max(self.soft_reward_tau, 1e-8), dim=-1)
+        rewards = (probs * R_cand).sum(dim=-1).reshape(B, G)
+        win_rates = (probs * W_cand).sum(dim=-1).reshape(B, G)
+        return rewards, win_rates
 
     def grpo_step(self, user_emb, user_ids, item_emb_all, user_pos_items):
         """Single GRPO update step.
@@ -192,23 +265,31 @@ class GRPOTrainer:
             )
 
         # 2. Compute rewards for each trajectory
-        pos_embs = self._get_pos_embs(user_ids, item_emb_all, user_pos_items)
-        reward_emb = self._reward_embs(
-            final_emb, user_emb, user_ids, item_emb_all, user_pos_items,
-            pos_embs,
+        pos_embs, pos_mask = self._get_pos_embs(
+            user_ids, item_emb_all, user_pos_items,
         )
-        # final_emb: (B, G, d), pos_embs: (B, K, d)
-        rewards = []
-        win_rates = []
-        for g in range(G):
-            gen_g = reward_emb[:, g, :]  # (B, d)
-            W = self.reward_fn.win_rate(user_emb, gen_g, pos_embs)
-            R = self.reward_fn.compute_reward(W)
-            rewards.append(R)
-            win_rates.append(W)
+        if self.reward_mode == 'soft_topk':
+            rewards, win_rates = self._soft_topk_rewards(
+                final_emb, user_emb, user_ids, item_emb_all, user_pos_items,
+                pos_embs, pos_mask,
+            )
+        else:
+            reward_emb = self._reward_embs(
+                final_emb, user_emb, user_ids, item_emb_all, user_pos_items,
+                pos_embs, pos_mask,
+            )
+            # final_emb: (B, G, d), pos_embs: (B, K, d)
+            rewards = []
+            win_rates = []
+            for g in range(G):
+                gen_g = reward_emb[:, g, :]  # (B, d)
+                W = self.reward_fn.win_rate(user_emb, gen_g, pos_embs, pos_mask)
+                R = self.reward_fn.compute_reward(W)
+                rewards.append(R)
+                win_rates.append(W)
 
-        rewards = torch.stack(rewards, dim=1)  # (B, G)
-        win_rates = torch.stack(win_rates, dim=1)  # (B, G)
+            rewards = torch.stack(rewards, dim=1)  # (B, G)
+            win_rates = torch.stack(win_rates, dim=1)  # (B, G)
 
         # 3. Compute group advantages: Â = (R - mean) / (std + ε)
         r_mean = rewards.mean(dim=1, keepdim=True)
@@ -319,6 +400,9 @@ class GRPOTrainer:
 
             avg_loss = total_loss / max(n_batches, 1)
             avg_stats = {k: v / n_batches for k, v in total_stats.items()}
+            self.history.append(
+                {'phase': 'grpo', 'epoch': epoch + 1, **avg_stats}
+            )
 
             epoch_reward = avg_stats.get('reward_mean', 0)
             if epoch_reward > best_reward:
@@ -388,6 +472,7 @@ class GRPOTrainer:
             loss, stats = self.grpo_step(
                 u_emb, batch_uids, item_emb_all, user_pos_items
             )
+            self.history.append({'phase': 'joint', 'step': step + 1, **stats})
             should_log = (
                 step == 0
                 or step + 1 == n_steps

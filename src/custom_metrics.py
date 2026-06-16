@@ -24,19 +24,25 @@ def compute_fn_rate(generated_item_ids, test_positive_dict, user_ids):
     return fn_count / max(total, 1)
 
 
-def compute_w_statistics(user_emb, gen_emb, pos_item_embs):
+def compute_w_statistics(user_emb, gen_emb, pos_item_embs, pos_mask=None):
     """Compute win rate distribution statistics.
 
     Args:
         user_emb: (B, d)
         gen_emb: (B, d)
         pos_item_embs: (B, K, d)
+        pos_mask: optional (B, K) bool marking real (non-padded) positives
     Returns:
         dict with mean, std, histogram counts for W
     """
     score_gen = (user_emb * gen_emb).sum(dim=-1, keepdim=True)
     score_pos = (user_emb.unsqueeze(1) * pos_item_embs).sum(dim=-1)
-    W = torch.sigmoid(score_gen - score_pos).mean(dim=-1)
+    wins = torch.sigmoid(score_gen - score_pos)
+    if pos_mask is None:
+        W = wins.mean(dim=-1)
+    else:
+        mask = pos_mask.to(wins.dtype)
+        W = (wins * mask).sum(dim=-1) / mask.sum(dim=-1).clamp_min(1.0)
 
     W_np = W.detach().cpu().numpy()
     bins = np.linspace(0, 1, 11)

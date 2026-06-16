@@ -5,27 +5,46 @@ import torch.nn.functional as F
 class EmbeddingToItemMapper:
     """Map generated continuous embeddings to discrete item IDs."""
 
-    def __init__(self, item_embeddings, temperature=0.1, chunk_size=16384):
+    def __init__(self, item_embeddings, temperature=0.1, chunk_size=16384,
+                 metric='cosine'):
         """
         Args:
             item_embeddings: (n_items, d) all item embeddings
             temperature: softmax temperature for soft mapping
             chunk_size: max generated embeddings to map in one similarity block
+            metric: 'cosine' or 'dot'. The reward/BPR scores are dot products, so
+                'dot' keeps the mapping consistent with the scoring space, while
+                'cosine' (default, original behavior) discards norm information.
         """
+        if metric not in {'cosine', 'dot'}:
+            raise ValueError('metric must be "cosine" or "dot"')
         self.item_embeddings = item_embeddings
         self.temperature = temperature
         self.chunk_size = chunk_size
+        self.metric = metric
         self._norm_emb = F.normalize(item_embeddings, dim=-1)
 
     def update_embeddings(self, item_embeddings):
         self.item_embeddings = item_embeddings
         self._norm_emb = F.normalize(item_embeddings, dim=-1)
 
+    def gen_item_similarity(self, gen_embeddings):
+        """Similarity of generated embeddings to every item under self.metric.
+
+        Args:
+            gen_embeddings: (N, d)
+        Returns:
+            sim: (N, n_items)
+        """
+        if self.metric == 'dot':
+            return gen_embeddings @ self.item_embeddings.T
+        return F.normalize(gen_embeddings, dim=-1) @ self._norm_emb.T
+
     @torch.no_grad()
     def map_to_items(self, gen_embeddings, forbidden_item_ids=None,
                      exclude_item_ids=None, user_emb=None, pos_item_embs=None,
-                     reward_fn=None, strategy='nearest', candidate_topk=50,
-                     boundary_safe_w=0.5):
+                     pos_mask=None, reward_fn=None, strategy='nearest',
+                     candidate_topk=50, boundary_safe_w=0.5):
         """Nearest-neighbor mapping to item IDs.
 
         Args:
@@ -34,6 +53,8 @@ class EmbeddingToItemMapper:
             exclude_item_ids: optional global item ids to mask for every sample
             user_emb: optional user embeddings for score-aware selection
             pos_item_embs: optional positives for reward-aware selection
+            pos_mask: optional bool mask aligned with pos_item_embs' K dim marking
+                real (non-padded) positives; without it padded slots bias W
             reward_fn: optional reward function with win_rate/compute_reward
             strategy: nearest, hard_topk, reward_topk, score_topk, or boundary_topk
             candidate_topk: number of nearest generated-embedding neighbors to rerank
@@ -68,6 +89,10 @@ class EmbeddingToItemMapper:
                     pos_item_embs.shape[-1],
                 )
 
+            flat_mask = None
+            if pos_mask is not None:
+                flat_mask = pos_mask.reshape(flat.shape[0], pos_mask.shape[-1])
+
             chunks = []
             for start in range(0, flat.shape[0], self.chunk_size):
                 end = min(start + self.chunk_size, flat.shape[0])
@@ -81,6 +106,7 @@ class EmbeddingToItemMapper:
                     exclude_item_ids=exclude_item_ids,
                     user_emb=None if flat_user is None else flat_user[start:end],
                     pos_item_embs=None if flat_pos is None else flat_pos[start:end],
+                    pos_mask=None if flat_mask is None else flat_mask[start:end],
                     reward_fn=reward_fn,
                     strategy=strategy,
                     candidate_topk=candidate_topk,
@@ -88,9 +114,7 @@ class EmbeddingToItemMapper:
                 ))
             return torch.cat(chunks, dim=0).reshape(orig_shape)
 
-        flat_norm = F.normalize(flat, dim=-1)
-
-        sim = flat_norm @ self._norm_emb.T  # (N, n_items)
+        sim = self.gen_item_similarity(flat)  # (N, n_items)
         n_items = sim.shape[1]
         if exclude_item_ids is not None:
             ids = torch.as_tensor(
@@ -151,9 +175,13 @@ class EmbeddingToItemMapper:
 
             cand_ids = score_logits.topk(k=k, dim=-1).indices
             cand_emb = self.item_embeddings[cand_ids]
-            cand_sim = (
-                F.normalize(cand_emb, dim=-1) * flat_norm.unsqueeze(1)
-            ).sum(dim=-1)
+            if self.metric == 'dot':
+                cand_sim = (cand_emb * flat.unsqueeze(1)).sum(dim=-1)
+            else:
+                cand_sim = (
+                    F.normalize(cand_emb, dim=-1)
+                    * F.normalize(flat, dim=-1).unsqueeze(1)
+                ).sum(dim=-1)
             chosen = cand_sim.argmax(dim=-1)
             item_ids = cand_ids.gather(1, chosen.unsqueeze(-1)).squeeze(-1)
             return item_ids.reshape(orig_shape)
@@ -176,7 +204,16 @@ class EmbeddingToItemMapper:
             score_pos = (
                 flat_user.unsqueeze(1) * flat_pos
             ).sum(dim=-1).unsqueeze(1)  # (N, 1, K)
-            W = torch.sigmoid(cand_scores.unsqueeze(-1) - score_pos).mean(dim=-1)
+            wins = torch.sigmoid(cand_scores.unsqueeze(-1) - score_pos)  # (N, k, K)
+            if pos_mask is None:
+                W = wins.mean(dim=-1)
+            else:
+                flat_mask = pos_mask.reshape(
+                    flat.shape[0], pos_mask.shape[-1],
+                ).to(wins.dtype).unsqueeze(1)  # (N, 1, K)
+                W = (wins * flat_mask).sum(dim=-1) / flat_mask.sum(
+                    dim=-1,
+                ).clamp_min(1.0)
             rewards = reward_fn.compute_reward(W)
             if strategy == 'boundary_topk':
                 # Drop candidates that beat the positives too often (likely false
@@ -203,6 +240,5 @@ class EmbeddingToItemMapper:
         Returns:
             probs: (B, n_items)
         """
-        gen_norm = F.normalize(gen_embeddings, dim=-1)
-        sim = gen_norm @ self._norm_emb.T / self.temperature
+        sim = self.gen_item_similarity(gen_embeddings) / self.temperature
         return F.softmax(sim, dim=-1)

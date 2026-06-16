@@ -1,3 +1,4 @@
+import math
 import random
 import time
 
@@ -7,6 +8,39 @@ import torch.optim as optim
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+class SinusoidalTimeEmbedding(nn.Module):
+    """Fixed (non-learned) sinusoidal embedding for continuous t ∈ [0, 1].
+
+    Maps a scalar t to a multi-frequency basis {cos(ω_k·t̃), sin(ω_k·t̃)} so the
+    main MLP can represent arbitrary-frequency dependence on t by a linear
+    combination. Unlike a learned MLP on the raw scalar t, this provides the
+    right inductive bias from the start and adds no trainable parameters.
+
+    t is rescaled by `time_scale` (default 1000) so the continuous range [0, 1]
+    spans the same effective range as DDPM's discrete timesteps, giving good
+    frequency coverage; `max_period` controls the lowest frequency.
+    """
+
+    def __init__(self, dim, max_period=10000.0, time_scale=1000.0):
+        super().__init__()
+        self.dim = dim
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period) * torch.arange(half, dtype=torch.float32) / max(half, 1)
+        )
+        self.register_buffer('freqs', freqs, persistent=False)
+        self.time_scale = time_scale
+
+    def forward(self, t):
+        # t: (B,) or (B, 1) in [0, 1]
+        t = t.reshape(-1, 1) * self.time_scale
+        args = t * self.freqs.to(t.dtype).unsqueeze(0)  # (B, half)
+        emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if self.dim % 2 == 1:  # pad to exact dim
+            emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=-1)
+        return emb
 
 
 class ConditionalVelocityNet(nn.Module):
@@ -19,11 +53,7 @@ class ConditionalVelocityNet(nn.Module):
         self.emb_dim = emb_dim
         self.time_embed_dim = time_embed_dim
 
-        self.time_mlp = nn.Sequential(
-            nn.Linear(1, time_embed_dim),
-            nn.SiLU(),
-            nn.Linear(time_embed_dim, time_embed_dim),
-        )
+        self.time_embed = SinusoidalTimeEmbedding(time_embed_dim)
 
         input_dim = emb_dim + emb_dim + time_embed_dim
         layers = []
@@ -44,9 +74,7 @@ class ConditionalVelocityNet(nn.Module):
         Returns:
             velocity: (B, d)
         """
-        if t.dim() == 1:
-            t = t.unsqueeze(-1)
-        t_embed = self.time_mlp(t)
+        t_embed = self.time_embed(t)
         inp = torch.cat([x_t, user_emb, t_embed], dim=-1)
         return self.net(inp)
 

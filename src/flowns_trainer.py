@@ -45,12 +45,30 @@ FLOW_CONFIG_DEFAULTS = {
     'grpo_old_policy_scope': 'batch',
     'grpo_normalize_log_ratio': False,
     'grpo_reward_mode': 'mapped_item',
+    'soft_reward_tau': 0.1,
     'reward_a': 1.0,
     'reward_gamma': 1.0,
     'joint_rec_epochs': 100,
     'joint_grpo_freq': 5,
     'joint_grpo_steps': 2,
     'joint_num_negatives': 1,
+    # 'discrete' (default): map flow samples to item ids, BPR on the mapped item.
+    # 'continuous': skip the bridge — BPR scores the continuous flow embedding
+    # directly (neg_score = u·x_gen). A synthetic embedding is not a held-out
+    # item, so it cannot be an exact discrete false negative; the boundary reward
+    # + KL anchor keep x_gen near W≈0.5 on the real-negative manifold.
+    # 'dns': DNS-style hard selection over a candidate POOL — draw
+    # dns_candidate_num items, score them with the live model, keep the hardest.
+    # dns_candidate_source picks the pool: 'uniform' = vanilla DNS; 'flow' = our
+    # contribution (a realistic flow-generated pool). Comparing the two isolates
+    # exactly the realness contribution, with hardness held fixed by DNS.
+    'joint_negative_mode': 'discrete',
+    'dns_candidate_source': 'flow',
+    'dns_candidate_num': 10,
+    # When True, DNS keeps the hardest candidate that still scores BELOW the
+    # paired positive under the live model (W<=0.5, FN-safe), instead of the
+    # absolute hardest. Needed for the FN-prone flow pool; ~no-op for uniform.
+    'dns_safe_selection': False,
     'joint_lr': None,
     'eval_step': 5,
     'stopping_step': 10,
@@ -61,6 +79,7 @@ FLOW_CONFIG_DEFAULTS = {
     'joint_exposed_neg_ratio': 0.0,
     'mapping_strategy': 'nearest',
     'mapping_topk': 50,
+    'mapping_metric': 'cosine',
     'boundary_safe_w': 0.5,
     'mapper_chunk_size': 16384,
     'negative_source': 'random',
@@ -200,6 +219,15 @@ class FlowNSTrainer:
         self.joint_grpo_freq = fc.get('joint_grpo_freq', 5)
         self.joint_grpo_steps = fc.get('joint_grpo_steps', 2)
         self.joint_num_negatives = max(int(fc.get('joint_num_negatives', 1)), 1)
+        self.joint_negative_mode = fc.get('joint_negative_mode', 'discrete')
+        if self.joint_negative_mode not in {'discrete', 'continuous', 'dns'}:
+            raise ValueError(
+                'joint_negative_mode must be "discrete", "continuous", or "dns"'
+            )
+        self.dns_candidate_source = fc.get('dns_candidate_source', 'flow')
+        if self.dns_candidate_source not in {'flow', 'uniform'}:
+            raise ValueError('dns_candidate_source must be "flow" or "uniform"')
+        self.dns_candidate_num = max(int(fc.get('dns_candidate_num', 10)), 1)
         self.joint_lr = fc.get('joint_lr', None)
         self.eval_step = fc.get('eval_step', 5)
         self.stopping_step = fc.get('stopping_step', 10)
@@ -211,7 +239,10 @@ class FlowNSTrainer:
         self.joint_exposed_neg_ratio = fc.get('joint_exposed_neg_ratio', 0.0)
         self.mapping_strategy = fc.get('mapping_strategy', 'nearest')
         self.mapping_topk = fc.get('mapping_topk', 50)
+        self.mapping_metric = fc.get('mapping_metric', 'cosine')
+        self.soft_reward_tau = float(fc.get('soft_reward_tau', 0.1))
         self.boundary_safe_w = float(fc.get('boundary_safe_w', 0.5))
+        self.dns_safe_selection = bool(fc.get('dns_safe_selection', False))
         self.mapper_chunk_size = max(int(fc.get('mapper_chunk_size', 16384)), 1)
         self.negative_source = fc.get('negative_source', 'random')
         self.rec_checkpoint_path = fc.get('rec_checkpoint_path')
@@ -396,6 +427,7 @@ class FlowNSTrainer:
         if self.mapper is None:
             self.mapper = EmbeddingToItemMapper(
                 item_emb, chunk_size=self.mapper_chunk_size,
+                metric=self.mapping_metric,
             )
         else:
             self.mapper.update_embeddings(item_emb)
@@ -427,12 +459,16 @@ class FlowNSTrainer:
                 mapping_strategy=self.mapping_strategy,
                 mapping_topk=self.mapping_topk,
                 boundary_safe_w=self.boundary_safe_w,
+                soft_reward_tau=self.soft_reward_tau,
             )
 
     def _get_pos_embs_for_users(self, user_ids, item_emb):
         K = self.max_pos_samples
         d = item_emb.shape[1]
         pos_embs = torch.zeros(len(user_ids), K, d, device=item_emb.device)
+        pos_mask = torch.zeros(
+            len(user_ids), K, dtype=torch.bool, device=item_emb.device,
+        )
         for row, uid in enumerate(user_ids):
             pos_ids = list(self.user_pos_items.get(int(uid), []))
             if not pos_ids:
@@ -441,7 +477,8 @@ class FlowNSTrainer:
                 indices = torch.randperm(len(pos_ids))[:K]
                 pos_ids = [pos_ids[int(i)] for i in indices]
             pos_embs[row, :len(pos_ids)] = item_emb[pos_ids]
-        return pos_embs
+            pos_mask[row, :len(pos_ids)] = True
+        return pos_embs, pos_mask
 
     def _sample_exposed_negatives(self, user_ids, n_negatives, fallback_neg):
         if not self.user_neg_items:
@@ -681,6 +718,11 @@ class FlowNSTrainer:
         independently uses flow or random negatives.
         """
         if self.is_autoencoder_backbone:
+            if self.joint_negative_mode == 'continuous':
+                raise NotImplementedError(
+                    'continuous negatives are only implemented for embedding '
+                    'backbones (LightGCN/BPR), not autoencoder backbones.'
+                )
             return self._make_autoencoder_custom_loss(item_emb)
 
         model = self.rec_model
@@ -694,6 +736,160 @@ class FlowNSTrainer:
         mapping_topk = self.mapping_topk
         n_negatives = self.joint_num_negatives
         use_flow = self._joint_uses_flow_negatives()
+        continuous_neg = self.joint_negative_mode == 'continuous'
+
+        def _reg_term(u_ids, p_ids, neg_ego):
+            """LightGCN L2 reg; None when the backbone has no reg_loss/reg_weight."""
+            reg_fn = getattr(model, 'reg_loss', None)
+            reg_weight = getattr(model, 'reg_weight', None)
+            if reg_fn is None or reg_weight is None:
+                return None
+            u_ego = model.user_embedding(u_ids)
+            pos_ego = model.item_embedding(p_ids)
+            require_pow = getattr(model, 'require_pow', False)
+            if neg_ego is None:
+                return reg_weight * reg_fn(u_ego, pos_ego, require_pow=require_pow)
+            return reg_weight * reg_fn(u_ego, pos_ego, neg_ego, require_pow=require_pow)
+
+        def continuous_loss(interaction):
+            """BPR with the continuous flow embedding as the negative (no bridge)."""
+            user_ids = interaction[model.USER_ID]
+            pos_item_ids = interaction[model.ITEM_ID]
+            with torch.no_grad():
+                u_emb = user_emb_all[user_ids]
+                neg_cont, _, _ = sde_sampler.sample_trajectories(
+                    u_emb, n_trajectories=n_negatives,
+                )  # (B, n_neg, d), detached, in item-embedding space
+
+            if getattr(model, 'restore_user_e', None) is not None:
+                model.restore_user_e = None
+            if getattr(model, 'restore_item_e', None) is not None:
+                model.restore_item_e = None
+
+            user_all_embeddings, item_all_embeddings = forward_all_embeddings(model)
+            u_embeddings = user_all_embeddings[user_ids]
+            pos_embeddings = item_all_embeddings[pos_item_ids]
+            pos_scores = (u_embeddings * pos_embeddings).sum(dim=-1)  # (B,)
+            neg_scores = (
+                u_embeddings.unsqueeze(1) * neg_cont
+            ).sum(dim=-1)  # (B, n_neg)
+            score_diff = pos_scores.unsqueeze(1) - neg_scores
+            gamma = getattr(getattr(model, 'mf_loss', None), 'gamma', 1e-10)
+            mf_loss = -torch.log(gamma + torch.sigmoid(score_diff)).mean()
+            reg = _reg_term(user_ids, pos_item_ids, neg_ego=None)
+            return mf_loss if reg is None else mf_loss + reg
+
+        if continuous_neg:
+            if not use_flow:
+                raise RuntimeError(
+                    'joint_negative_mode=continuous requires flow negatives '
+                    '(flow_neg_ratio>0, not use_random).'
+                )
+            return continuous_loss
+
+        dns_source = self.dns_candidate_source
+        dns_k = self.dns_candidate_num
+        n_items_total = int(getattr(model, 'n_items', self.dataset.item_num))
+
+        def dns_loss(interaction):
+            """DNS-style hardest-of-k over a candidate pool (uniform vs flow).
+
+            Only the candidate POOL differs between sources; hardness is supplied
+            identically by argmax over the live model's scores. Isolates realness.
+            """
+            user_ids = interaction[model.USER_ID]
+            pos_item_ids = interaction[model.ITEM_ID]
+            B = user_ids.shape[0]
+
+            if getattr(model, 'restore_user_e', None) is not None:
+                model.restore_user_e = None
+            if getattr(model, 'restore_item_e', None) is not None:
+                model.restore_item_e = None
+            user_all_embeddings, item_all_embeddings = forward_all_embeddings(model)
+
+            with torch.no_grad():
+                if dns_source == 'flow':
+                    u_emb = user_emb_all[user_ids]
+                    cand_cont, _, _ = sde_sampler.sample_trajectories(
+                        u_emb, n_trajectories=dns_k,
+                    )  # (B, k, d)
+                    forbidden = [
+                        user_pos.get(int(uid), set())
+                        for uid in user_ids.tolist()
+                        for _ in range(dns_k)
+                    ]
+                    cand_ids = mapper.map_to_items(
+                        cand_cont,
+                        forbidden_item_ids=forbidden,
+                        exclude_item_ids=(0,),
+                        strategy='nearest',
+                    ).reshape(B, dns_k)
+                else:  # uniform pool = vanilla DNS
+                    cand_ids = torch.randint(
+                        1, n_items_total, (B, dns_k), device=user_ids.device,
+                    )
+                # Exclude the user's train positives from the pool, then score
+                # with the live model and keep the hardest. Without this mask a
+                # positive in the pool scores highest and gets picked as the
+                # negative — a guaranteed false negative. The flow pool is already
+                # positive-free via the mapper; masking here keeps uniform fair
+                # and matches RecBole's native DNS (which excludes positives).
+                u_sel = user_all_embeddings[user_ids].detach()  # (B, d)
+                cand_emb_sel = item_all_embeddings[cand_ids].detach()  # (B, k, d)
+                cand_scores = (u_sel.unsqueeze(1) * cand_emb_sel).sum(dim=-1)
+                cand_rows = cand_ids.tolist()
+                uid_rows = user_ids.tolist()
+                pos_mask = torch.zeros_like(cand_scores, dtype=torch.bool)
+                for i, uid in enumerate(uid_rows):
+                    pos = user_pos.get(int(uid))
+                    if not pos:
+                        continue
+                    row = cand_rows[i]
+                    for j in range(dns_k):
+                        if row[j] in pos:
+                            pos_mask[i, j] = True
+                cand_scores = cand_scores.masked_fill(pos_mask, float('-inf'))
+                if self.dns_safe_selection:
+                    # Keep the hardest candidate that still scores BELOW the
+                    # paired positive under the live model (W<=0.5, FN-safe). If
+                    # every candidate outscores the positive, fall back to the
+                    # least-hard one to minimise false-negative poisoning.
+                    pos_emb_sel = item_all_embeddings[pos_item_ids].detach()
+                    pos_score_sel = (u_sel * pos_emb_sel).sum(dim=-1, keepdim=True)
+                    safe_scores = cand_scores.masked_fill(
+                        cand_scores > pos_score_sel, float('-inf'),
+                    )
+                    all_unsafe = torch.isinf(safe_scores).all(dim=1)
+                    least_hard = cand_scores.masked_fill(
+                        pos_mask, float('inf'),
+                    ).argmin(dim=1)
+                    hardest = torch.where(
+                        all_unsafe, least_hard, safe_scores.argmax(dim=1),
+                    )
+                else:
+                    hardest = cand_scores.argmax(dim=1)  # (B,)
+                neg_ids = cand_ids.gather(1, hardest.unsqueeze(1)).squeeze(1)
+
+            u_embeddings = user_all_embeddings[user_ids]
+            pos_embeddings = item_all_embeddings[pos_item_ids]
+            neg_embeddings = item_all_embeddings[neg_ids]
+            pos_scores = (u_embeddings * pos_embeddings).sum(dim=-1)
+            neg_scores = (u_embeddings * neg_embeddings).sum(dim=-1)
+            gamma = getattr(getattr(model, 'mf_loss', None), 'gamma', 1e-10)
+            mf_loss = -torch.log(
+                gamma + torch.sigmoid(pos_scores - neg_scores)
+            ).mean()
+            reg = _reg_term(
+                user_ids, pos_item_ids, model.item_embedding(neg_ids),
+            )
+            return mf_loss if reg is None else mf_loss + reg
+
+        if self.joint_negative_mode == 'dns':
+            if dns_source == 'flow' and not use_flow:
+                raise RuntimeError(
+                    'dns_candidate_source=flow requires flow negatives.'
+                )
+            return dns_loss
 
         def custom_loss(interaction):
             user_ids = interaction[model.USER_ID]
@@ -718,15 +914,19 @@ class FlowNSTrainer:
                         for _ in range(n_negatives)
                     ]
                     pos_embs = None
+                    pos_mask = None
                     mapper_user_emb = u_emb.unsqueeze(1).expand(
                         B, n_negatives, u_emb.shape[-1],
                     )
                     if mapping_strategy in ('reward_topk', 'boundary_topk'):
-                        pos_base = self._get_pos_embs_for_users(
+                        pos_base, mask_base = self._get_pos_embs_for_users(
                             user_ids.tolist(), item_emb,
                         )
                         pos_embs = pos_base.unsqueeze(1).expand(
                             B, n_negatives, pos_base.shape[-2], pos_base.shape[-1],
+                        )
+                        pos_mask = mask_base.unsqueeze(1).expand(
+                            B, n_negatives, mask_base.shape[-1],
                         )
                     flow_neg = mapper.map_to_items(
                         final_emb,
@@ -734,6 +934,7 @@ class FlowNSTrainer:
                         exclude_item_ids=(0,),
                         user_emb=mapper_user_emb,
                         pos_item_embs=pos_embs,
+                        pos_mask=pos_mask,
                         reward_fn=self.reward_fn,
                         strategy=mapping_strategy,
                         candidate_topk=mapping_topk,
@@ -889,14 +1090,20 @@ class FlowNSTrainer:
                         B, n_negatives, u_emb.shape[-1],
                     )
                     pos_embs = None
+                    pos_mask = None
                     if mapping_strategy in ('reward_topk', 'boundary_topk'):
                         # For MultiVAE the item embedding is the decoder weight
                         # vector and u_emb is the pre-decoder hidden, so u·item is
                         # the decoder logit. Reward-aware mapping is therefore
                         # consistent with the AE scoring function.
-                        pos_base = self._get_pos_embs_for_users(uid_list, item_emb)
+                        pos_base, mask_base = self._get_pos_embs_for_users(
+                            uid_list, item_emb,
+                        )
                         pos_embs = pos_base.unsqueeze(1).expand(
                             B, n_negatives, pos_base.shape[-2], pos_base.shape[-1],
+                        )
+                        pos_mask = mask_base.unsqueeze(1).expand(
+                            B, n_negatives, mask_base.shape[-1],
                         )
                     flow_neg = mapper.map_to_items(
                         final_emb,
@@ -904,6 +1111,7 @@ class FlowNSTrainer:
                         exclude_item_ids=(0,),
                         user_emb=mapper_user_emb,
                         pos_item_embs=pos_embs,
+                        pos_mask=pos_mask,
                         reward_fn=self.reward_fn,
                         strategy=mapping_strategy,
                         candidate_topk=mapping_topk,
@@ -1113,11 +1321,17 @@ class FlowNSTrainer:
                         batch_size, n_negatives, u_emb.shape[-1],
                     )
                     pos_embs = None
-                    if mapping_strategy == 'reward_topk':
-                        pos_base = self._get_pos_embs_for_users(uid_list, item_emb)
+                    pos_mask = None
+                    if mapping_strategy in ('reward_topk', 'boundary_topk'):
+                        pos_base, mask_base = self._get_pos_embs_for_users(
+                            uid_list, item_emb,
+                        )
                         pos_embs = pos_base.unsqueeze(1).expand(
                             batch_size, n_negatives,
                             pos_base.shape[-2], pos_base.shape[-1],
+                        )
+                        pos_mask = mask_base.unsqueeze(1).expand(
+                            batch_size, n_negatives, mask_base.shape[-1],
                         )
 
                     neg_ids = self.mapper.map_to_items(
@@ -1126,9 +1340,11 @@ class FlowNSTrainer:
                         exclude_item_ids=(0,),
                         user_emb=mapper_user_emb,
                         pos_item_embs=pos_embs,
+                        pos_mask=pos_mask,
                         reward_fn=self.reward_fn,
                         strategy=mapping_strategy,
                         candidate_topk=mapping_topk,
+                        boundary_safe_w=self.boundary_safe_w,
                     )
 
             rows = torch.arange(batch_size, device=scores.device)

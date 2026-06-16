@@ -33,6 +33,45 @@ from recbole.utils import init_seed, init_logger
 
 logger = logging.getLogger(__name__)
 
+# RecBole's dynamic negative sampling (DNS) crashes on GPU: model.predict puts
+# `indices` on the GPU while `neg_candidate_ids` stays on CPU, so the gather
+# `neg_candidate_ids[indices, ...]` raises a device mismatch. Patch the dynamic
+# branch to move indices to the candidates' device; non-dynamic falls through to
+# the original. Lets us run DNS baselines (train_neg_sample_args.dynamic=True).
+import copy as _copy
+from recbole.data.dataloader.abstract_dataloader import NegSampleDataLoader as _NSDL
+from recbole.data.interaction import Interaction as _Interaction
+
+_orig_neg_sampling = _NSDL._neg_sampling
+
+
+def _patched_neg_sampling(self, inter_feat):
+    if self.neg_sample_args.get('dynamic', False):
+        candidate_num = self.neg_sample_args['candidate_num']
+        user_ids = inter_feat[self.uid_field].numpy()
+        item_ids = inter_feat[self.iid_field].numpy()
+        neg_candidate_ids = self._sampler.sample_by_user_ids(
+            user_ids, item_ids, self.neg_sample_num * candidate_num
+        )
+        self.model.eval()
+        interaction = _copy.deepcopy(inter_feat).to(self.model.device)
+        interaction = interaction.repeat(self.neg_sample_num * candidate_num)
+        interaction.update(_Interaction(
+            {self.iid_field: neg_candidate_ids.to(self.model.device)}
+        ))
+        scores = self.model.predict(interaction).reshape(candidate_num, -1)
+        indices = torch.max(scores, dim=0)[1].detach().to(neg_candidate_ids.device)
+        neg_candidate_ids = neg_candidate_ids.reshape(candidate_num, -1)
+        neg_item_ids = neg_candidate_ids[
+            indices, [i for i in range(neg_candidate_ids.shape[1])]
+        ].view(-1)
+        self.model.train()
+        return self.sampling_func(inter_feat, neg_item_ids)
+    return _orig_neg_sampling(self, inter_feat)
+
+
+_NSDL._neg_sampling = _patched_neg_sampling
+
 
 def setup_recbole(model_name, dataset_name, config_file_list=None, config_dict=None):
     argv = sys.argv

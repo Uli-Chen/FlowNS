@@ -41,6 +41,7 @@ EXPERIMENTS_FILE = CONFIGS_DIR / 'experiments.yaml'
 
 DATASET_CONFIGS = {
     'mind': CONFIGS_DIR / 'lightgcn_mind.yaml',
+    'kuairand': CONFIGS_DIR / 'lightgcn_kuairand.yaml',
     'ml-100k': CONFIGS_DIR / 'lightgcn_ml100k.yaml',
     'yelp-2018': CONFIGS_DIR / 'lightgcn_yelp.yaml',
     'amazon-books': CONFIGS_DIR / 'lightgcn_amazon.yaml',
@@ -52,35 +53,61 @@ def _safe_name(value):
     return value.replace('/', '_').replace('-', '_').replace('.', '_')
 
 
-def _result_stem(experiment, dataset):
+def _dataset_key_cache_path(path, dataset):
+    """Isolate an embedding-space cache (flow / flow-ref) per dataset.
+
+    A flow checkpoint lives in one recommender's embedding space, so a flow
+    trained on dataset A must never be loaded for dataset B. The velocity-net
+    state_dict shapes match across datasets (same embedding_size), so such a
+    load would succeed silently but be semantically wrong. Insert the dataset
+    name before the extension unless it is already present.
+    """
+    if not path:
+        return path
+    safe = _safe_name(dataset)
+    p = Path(str(path))
+    if f'_{safe}' in p.stem:
+        return str(path)
+    return str(p.with_name(f'{p.stem}_{safe}{p.suffix}'))
+
+
+def _result_stem(experiment, dataset, seed=None, tag=None):
+    stem = experiment
+    if dataset != 'mind':
+        stem = f'{stem}_{_safe_name(dataset)}'
+    if seed is not None:
+        stem = f'{stem}_s{int(seed)}'
+    if tag:
+        stem = f'{stem}_{_safe_name(str(tag))}'
+    return stem
+
+
+def _checkpoint_pointer(dataset, model):
+    """Per (dataset, model) M0 pointer so backbone lines never clobber each other."""
+    return RESULTS_DIR / (
+        f'M0_model_path.{_safe_name(dataset)}.{_safe_name(model)}.txt'
+    )
+
+
+def _legacy_checkpoint_pointers(dataset):
+    """Old pointer names (dataset-only) kept readable for existing checkpoints."""
+    pointers = [RESULTS_DIR / f'M0_model_path.{_safe_name(dataset)}.txt']
     if dataset == 'mind':
-        return experiment
-    return f'{experiment}_{_safe_name(dataset)}'
+        pointers.append(RESULTS_DIR / 'M0_model_path.txt')
+    return pointers
 
 
-def _checkpoint_pointer(dataset):
-    safe_dataset = _safe_name(dataset)
-    return RESULTS_DIR / f'M0_model_path.{safe_dataset}.txt'
-
-
-def _legacy_checkpoint_pointer(dataset):
-    if dataset == 'mind':
-        return RESULTS_DIR / 'M0_model_path.txt'
-    return None
-
-
-def _load_m0_checkpoint_path(dataset):
-    pointer_paths = [_checkpoint_pointer(dataset)]
-    legacy = _legacy_checkpoint_pointer(dataset)
-    if legacy is not None:
-        pointer_paths.append(legacy)
+def _load_m0_checkpoint_path(dataset, model):
+    pointer_paths = [_checkpoint_pointer(dataset, model)]
+    pointer_paths.extend(_legacy_checkpoint_pointers(dataset))
 
     pointer_path = next((path for path in pointer_paths if path.exists()), None)
     if pointer_path is None:
         searched = ', '.join(str(path) for path in pointer_paths)
         raise FileNotFoundError(
-            f'M0 checkpoint pointer not found for dataset={dataset}. '
-            f'Searched: {searched}. Run M0 first.'
+            f'M0 checkpoint pointer not found for dataset={dataset}, '
+            f'model={model}. Searched: {searched}. Run the matching S0 '
+            'baseline first.'
         )
 
     checkpoint_path = pointer_path.read_text().strip()
@@ -93,20 +120,15 @@ def _load_m0_checkpoint_path(dataset):
 
     if not checkpoint_path.exists():
         raise FileNotFoundError(
-            f'M0 checkpoint not found: {checkpoint_path}. Re-run M0.'
+            f'M0 checkpoint not found: {checkpoint_path}. Re-run the S0 baseline.'
         )
     return str(checkpoint_path)
 
 
-def _save_m0_checkpoint_path(dataset, checkpoint_path):
-    pointer_path = _checkpoint_pointer(dataset)
+def _save_m0_checkpoint_path(dataset, model, checkpoint_path):
+    pointer_path = _checkpoint_pointer(dataset, model)
     pointer_path.write_text(str(checkpoint_path))
     logger.info('M0 checkpoint pointer saved to %s', pointer_path)
-
-    legacy = _legacy_checkpoint_pointer(dataset)
-    if legacy is not None:
-        legacy.write_text(str(checkpoint_path))
-        logger.info('Legacy M0 checkpoint pointer saved to %s', legacy)
 
 
 def _read_yaml(path):
@@ -267,7 +289,7 @@ def _run_generation_diagnostics(trainer, sample_users):
         forbidden = [
             trainer.user_pos_items.get(int(uid), set()) for uid in sample_uids
         ]
-        pos_embs = trainer.grpo_trainer._get_pos_embs(
+        pos_embs, pos_mask = trainer.grpo_trainer._get_pos_embs(
             sample_uids, item_emb, trainer.user_pos_items,
         )
         mapped_ids = trainer.mapper.map_to_items(
@@ -276,15 +298,17 @@ def _run_generation_diagnostics(trainer, sample_users):
             exclude_item_ids=(0,),
             user_emb=sample_uemb,
             pos_item_embs=pos_embs,
+            pos_mask=pos_mask,
             reward_fn=trainer.reward_fn,
             strategy=trainer.mapping_strategy,
             candidate_topk=trainer.mapping_topk,
+            boundary_safe_w=trainer.boundary_safe_w,
         )
         mapped_emb = item_emb[mapped_ids]
 
     fn_rate = compute_fn_rate(mapped_ids, all_pos, sample_uids)
-    continuous_w = compute_w_statistics(sample_uemb, final_emb, pos_embs)
-    mapped_w = compute_w_statistics(sample_uemb, mapped_emb, pos_embs)
+    continuous_w = compute_w_statistics(sample_uemb, final_emb, pos_embs, pos_mask)
+    mapped_w = compute_w_statistics(sample_uemb, mapped_emb, pos_embs, pos_mask)
     unique_ratio = float(mapped_ids.unique().numel() / max(mapped_ids.numel(), 1))
 
     logger.info(
@@ -346,8 +370,17 @@ def _run_flowns_config(merged_config, dataset, seed=None):
     )
 
     flow_config = _extract_flow_config(merged_config, {})
+    # Flow caches are embedding-space-specific: key them by dataset so a flow
+    # pretrained on (e.g.) MIND is never silently loaded for KuaiRand.
+    for _cache_key in ('flow_checkpoint_path', 'flow_ref_checkpoint_path'):
+        if flow_config.get(_cache_key):
+            flow_config[_cache_key] = _dataset_key_cache_path(
+                flow_config[_cache_key], dataset,
+            )
     if merged_config.get('use_paired_m0', False):
-        flow_config['rec_checkpoint_path'] = _load_m0_checkpoint_path(dataset)
+        flow_config['rec_checkpoint_path'] = _load_m0_checkpoint_path(
+            dataset, model_name,
+        )
         logger.info('Using paired M0 checkpoint: %s', flow_config['rec_checkpoint_path'])
 
     if 'enabled_phases' not in flow_config and 'phases' in merged_config:
@@ -388,6 +421,8 @@ def _run_flowns_config(merged_config, dataset, seed=None):
         result.update(quality_result)
     if diagnostic_result:
         result['generation_diagnostics'] = diagnostic_result
+    if trainer.grpo_trainer is not None and trainer.grpo_trainer.history:
+        result['grpo_history'] = trainer.grpo_trainer.history
     return result, trainer
 
 
@@ -405,19 +440,24 @@ def run_experiment(args):
         merged_config, args.dataset, seed=args.seed,
     )
     experiment = result['experiment']
+    tag = getattr(args, 'tag', None)
+    if tag:
+        result['tag'] = tag
+    stem = _result_stem(experiment, args.dataset, seed=args.seed, tag=tag)
 
     if merged_config.get('save_rec_checkpoint_pointer', False):
-        _save_m0_checkpoint_path(args.dataset, trainer._rec_trainer.saved_model_file)
+        _save_m0_checkpoint_path(
+            args.dataset, result['model'], trainer._rec_trainer.saved_model_file,
+        )
 
     if merged_config.get('save_flow_model', False):
-        stem = _result_stem(experiment, args.dataset)
         flow_path = RESULTS_DIR / f'{stem}_flow.pt'
         ref_path = RESULTS_DIR / f'{stem}_flow_ref.pt'
         torch.save(trainer.flow_model.velocity_net.state_dict(), flow_path)
         torch.save(trainer.flow_model.ref_state_dict, ref_path)
         logger.info('Flow checkpoint saved to %s', flow_path)
 
-    out_path = RESULTS_DIR / f'{_result_stem(experiment, args.dataset)}.json'
+    out_path = RESULTS_DIR / f'{stem}.json'
     with open(out_path, 'w') as f:
         json.dump(result, f, indent=2)
     logger.info('Results saved to %s', out_path)
@@ -550,6 +590,9 @@ def build_parser():
                             help='Override phases, e.g. rec_pretrain,flow_pretrain')
     run_parser.add_argument('--set', dest='set_values', action='append', default=[],
                             help='Override KEY=VALUE; can be repeated')
+    run_parser.add_argument('--tag', default=None,
+                            help='Suffix for the result/flow file names; use to '
+                                 'keep sweep runs from overwriting each other')
     run_parser.set_defaults(func=run_experiment)
 
     fn_parser = subparsers.add_parser('fn-guarantee')

@@ -56,20 +56,3 @@ def compute_w_statistics(user_emb, gen_emb, pos_item_embs, pos_mask=None):
         'histogram': hist.tolist(),
         'bin_edges': bins.tolist(),
     }
-
-
-def theoretical_fn_bound(fn_rate_ref, r_max, beta):
-    """Compute theoretical FN rate upper bound.
-
-    FN(π_θ) ≤ exp(R_max / β) · FN(π_ref)
-
-    Args:
-        fn_rate_ref: FN rate of reference policy
-        r_max: maximum reward value
-        beta: KL penalty coefficient
-    Returns:
-        upper_bound: float
-    """
-    if beta <= 0:
-        return float('inf')
-    return np.exp(r_max / beta) * fn_rate_ref

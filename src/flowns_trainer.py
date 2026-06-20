@@ -1,16 +1,22 @@
 import logging
 import os
 import random
+import time
+
 import torch
 import torch.nn.functional as F
 import numpy as np
 
-from recbole.utils import calculate_valid_score, early_stopping
+from recbole.utils import (
+    calculate_valid_score,
+    dict2str,
+    early_stopping,
+    set_color,
+)
 
 from .flow_model import ConditionalFlowModel
 from .sde_sampler import SDESampler
 from .reward import BoundaryAwareReward
-from .grpo import GRPOTrainer
 from .neg_sampling import EmbeddingToItemMapper
 from .recbole_utils import (
     build_trainer,
@@ -32,25 +38,24 @@ FLOW_CONFIG_DEFAULTS = {
     'flow_pretrain_batch_size': 256,
     'flow_lr': 1e-4,
     'sde_steps': 20,
-    'eta': 0.5,
+    # eta=0 => deterministic Euler ODE (score + noise terms vanish). eta>0
+    # reactivates the Euler-Maruyama SDE (flow-GRPO machinery; GRPO removed).
+    'eta': 0.0,
     'delta': 0.01,
     'sde_sigma_min': 0.0,
     'sde_score_clamp': None,
-    'grpo_epochs': 10,
-    'grpo_group_size': 8,
-    'grpo_clip_eps': 0.2,
-    'grpo_beta': 0.1,
-    'grpo_lr': 1e-4,
-    'grpo_batch_size': 64,
-    'grpo_old_policy_scope': 'batch',
-    'grpo_normalize_log_ratio': False,
-    'grpo_reward_mode': 'mapped_item',
-    'soft_reward_tau': 0.1,
+    # Classifier-free guidance. cfg_dropout_prob: train-time probability of
+    # replacing the user condition with a learned null embedding (0.0 disables
+    # CFG). cfg_guidance_scale: sampling weight w in v_uncond + w·(v_cond-v_uncond)
+    # — 1.0 = plain conditional, >1 sharpens user conditioning, 0 = unconditional.
+    # Guidance only bites if the flow was trained with cfg_dropout_prob > 0.
+    'cfg_dropout_prob': 0.0,
+    'cfg_guidance_scale': 1.0,
+    # Reward shaping (R = W^a(1-W)^gamma) still drives the FN-safe bridge
+    # strategies (reward_topk / boundary_topk); GRPO has been removed.
     'reward_a': 1.0,
     'reward_gamma': 1.0,
     'joint_rec_epochs': 100,
-    'joint_grpo_freq': 5,
-    'joint_grpo_steps': 2,
     'joint_num_negatives': 1,
     # 'discrete' (default): map flow samples to item ids, BPR on the mapped item.
     # 'continuous': skip the bridge — BPR scores the continuous flow embedding
@@ -70,9 +75,15 @@ FLOW_CONFIG_DEFAULTS = {
     # absolute hardest. Needed for the FN-prone flow pool; ~no-op for uniform.
     'dns_safe_selection': False,
     'joint_lr': None,
-    'eval_step': 5,
+    # Validate once per epoch by default (matches RecBole's eval cadence).
+    'eval_step': 1,
     'stopping_step': 10,
     'disable_early_stopping': False,
+    # Phase 4 console output. True (详细): RecBole-style per-epoch train-loss
+    # line, eval line + full valid-result dict, and progress bars (gated by
+    # recbole show_progress). False (简略): one compact summary line per
+    # eval_step, no progress bars.
+    'joint_verbose': True,
     'max_pos_samples': 10,
     'flow_neg_ratio': 1.0,
     'flow_neg_loss_weight': 0.1,
@@ -88,7 +99,6 @@ FLOW_CONFIG_DEFAULTS = {
     'flow_checkpoint_path': None,
     'flow_ref_checkpoint_path': None,
     'flow_log_interval': 10,
-    'grpo_log_interval': 1,
     'rerank_num_negatives': 0,
     'rerank_neg_penalty': 0.0,
     'rerank_mapping_strategy': 'nearest',
@@ -106,8 +116,7 @@ FLOW_PHASE_ALIASES = {
     'phase2': 'flow_pretrain',
     'flow': 'flow_pretrain',
     'flow_train': 'flow_pretrain',
-    'phase3': 'grpo',
-    'rl': 'grpo',
+    'phase3': 'joint',
     'phase4': 'joint',
     'joint_train': 'joint',
     'finetune': 'joint',
@@ -135,17 +144,22 @@ def _normalize_enabled_phases(phases):
     normalized = []
     for phase in phases:
         phase_name = FLOW_PHASE_ALIASES.get(str(phase).strip(), str(phase).strip())
-        if phase_name not in {'rec_pretrain', 'flow_pretrain', 'grpo', 'joint'}:
+        if phase_name not in {'rec_pretrain', 'flow_pretrain', 'joint'}:
             raise ValueError(
                 f'Unknown FlowNS phase: {phase}. '
-                'Valid phases: rec_pretrain, flow_pretrain, grpo, joint.'
+                'Valid phases: rec_pretrain, flow_pretrain, joint.'
             )
         normalized.append(phase_name)
     return normalized
 
 
 class FlowNSTrainer:
-    """Configurable FlowNS trainer composing RecBole Trainer with flow + GRPO."""
+    """Configurable FlowNS trainer composing RecBole Trainer with the CFM flow.
+
+    Phases: rec_pretrain (Phase 1) -> flow_pretrain (Phase 2) -> joint (Phase 4,
+    co-train the recommender with flow/exposed/random negatives). GRPO has been
+    removed; the focus is backbone health and flow-sampler effectiveness.
+    """
 
     def __init__(self, config, rec_model, dataset, train_data, valid_data, test_data,
                  flow_config=None):
@@ -181,11 +195,15 @@ class FlowNSTrainer:
         )
         emb_dim = int(get_item_embeddings(rec_model).shape[1])
 
+        self.cfg_dropout_prob = float(fc.get('cfg_dropout_prob', 0.0))
+        self.cfg_guidance_scale = float(fc.get('cfg_guidance_scale', 1.0))
+
         self.flow_model = ConditionalFlowModel(
             emb_dim=emb_dim,
             hidden_dim=fc.get('flow_hidden_dim', 256),
             n_layers=fc.get('flow_n_layers', 3),
             device=str(self.device),
+            cfg_dropout_prob=self.cfg_dropout_prob,
         )
 
         self.sde_sampler = SDESampler(
@@ -195,6 +213,7 @@ class FlowNSTrainer:
             delta=fc.get('delta', 0.01),
             sigma_min=fc.get('sde_sigma_min', 0.0),
             score_clamp=fc.get('sde_score_clamp', None),
+            guidance_scale=self.cfg_guidance_scale,
         )
 
         self.reward_fn = BoundaryAwareReward(
@@ -204,20 +223,10 @@ class FlowNSTrainer:
 
         self.mapper = None  # initialized after Phase 1
 
-        self.grpo_trainer = None  # initialized after Phase 1
-
         self.flow_pretrain_epochs = fc.get('flow_pretrain_epochs', 50)
         self.flow_pretrain_batch_size = fc.get('flow_pretrain_batch_size', 256)
         self.flow_lr = fc.get('flow_lr', 1e-4)
-        self.grpo_epochs = fc.get('grpo_epochs', 10)
-        self.grpo_group_size = fc.get('grpo_group_size', 8)
-        self.grpo_clip_eps = fc.get('grpo_clip_eps', 0.2)
-        self.grpo_beta = fc.get('grpo_beta', 0.1)
-        self.grpo_lr = fc.get('grpo_lr', 1e-4)
-        self.grpo_batch_size = fc.get('grpo_batch_size', 64)
         self.joint_rec_epochs = fc.get('joint_rec_epochs', 100)
-        self.joint_grpo_freq = fc.get('joint_grpo_freq', 5)
-        self.joint_grpo_steps = fc.get('joint_grpo_steps', 2)
         self.joint_num_negatives = max(int(fc.get('joint_num_negatives', 1)), 1)
         self.joint_negative_mode = fc.get('joint_negative_mode', 'discrete')
         if self.joint_negative_mode not in {'discrete', 'continuous', 'dns'}:
@@ -229,9 +238,10 @@ class FlowNSTrainer:
             raise ValueError('dns_candidate_source must be "flow" or "uniform"')
         self.dns_candidate_num = max(int(fc.get('dns_candidate_num', 10)), 1)
         self.joint_lr = fc.get('joint_lr', None)
-        self.eval_step = fc.get('eval_step', 5)
+        self.eval_step = fc.get('eval_step', 1)
         self.stopping_step = fc.get('stopping_step', 10)
         self.disable_early_stopping = fc.get('disable_early_stopping', False)
+        self.joint_verbose = bool(fc.get('joint_verbose', True))
         self.max_pos_samples = fc.get('max_pos_samples', 10)
         self.use_random_neg = fc.get('use_random_neg', False)
         self.flow_neg_ratio = fc.get('flow_neg_ratio', 1.0)
@@ -240,7 +250,6 @@ class FlowNSTrainer:
         self.mapping_strategy = fc.get('mapping_strategy', 'nearest')
         self.mapping_topk = fc.get('mapping_topk', 50)
         self.mapping_metric = fc.get('mapping_metric', 'cosine')
-        self.soft_reward_tau = float(fc.get('soft_reward_tau', 0.1))
         self.boundary_safe_w = float(fc.get('boundary_safe_w', 0.5))
         self.dns_safe_selection = bool(fc.get('dns_safe_selection', False))
         self.mapper_chunk_size = max(int(fc.get('mapper_chunk_size', 16384)), 1)
@@ -249,7 +258,6 @@ class FlowNSTrainer:
         self.flow_checkpoint_path = fc.get('flow_checkpoint_path')
         self.flow_ref_checkpoint_path = fc.get('flow_ref_checkpoint_path')
         self.flow_log_interval = fc.get('flow_log_interval', 10)
-        self.grpo_log_interval = fc.get('grpo_log_interval', 1)
         self.rerank_num_negatives = max(int(fc.get('rerank_num_negatives', 0)), 0)
         self.rerank_neg_penalty = float(fc.get('rerank_neg_penalty', 0.0))
         self.rerank_mapping_strategy = fc.get('rerank_mapping_strategy', 'nearest')
@@ -265,7 +273,7 @@ class FlowNSTrainer:
                 self.enabled_phases = ['rec_pretrain', 'joint']
             else:
                 self.enabled_phases = [
-                    'rec_pretrain', 'flow_pretrain', 'grpo', 'joint',
+                    'rec_pretrain', 'flow_pretrain', 'joint',
                 ]
 
         # Match RecBole's train sampler: training negatives only exclude
@@ -286,14 +294,14 @@ class FlowNSTrainer:
         )
         logger.info(
             'FlowNS config: flow_hidden_dim=%s, flow_layers=%s, '
-            'flow_epochs=%s, grpo_epochs=%s, joint_epochs=%s, '
+            'flow_epochs=%s, joint_epochs=%s, '
             'joint_negatives=%s, exposed_ratio=%.3f, flow_ratio=%.3f, '
             'flow_neg_loss_weight=%.4f, '
             'mapping=%s@%s, rerank=%s/%d/%.4f, '
             'eval_exposed_penalty=%.4f, random_neg=%s, backbone=%s, '
             'emb_dim=%d, checkpoint=%s',
             fc.get('flow_hidden_dim'), fc.get('flow_n_layers'),
-            self.flow_pretrain_epochs, self.grpo_epochs,
+            self.flow_pretrain_epochs,
             self.joint_rec_epochs, self.joint_num_negatives,
             float(self.joint_exposed_neg_ratio), float(self.flow_neg_ratio),
             self.flow_neg_loss_weight,
@@ -304,6 +312,14 @@ class FlowNSTrainer:
             'autoencoder' if self.is_autoencoder_backbone else 'embedding',
             emb_dim,
             self.rec_checkpoint_path or 'none',
+        )
+        logger.info(
+            'FlowNS CFG: cfg_dropout_prob=%.3f (train), '
+            'cfg_guidance_scale=%.3f (sample)%s',
+            self.cfg_dropout_prob, self.cfg_guidance_scale,
+            '' if self.cfg_dropout_prob > 0.0 or self.cfg_guidance_scale == 1.0
+            else ' [WARNING: guidance_scale != 1 but flow trained without '
+                 'condition dropout — the unconditional field is untrained]',
         )
 
     def _load_exposed_negatives(self):
@@ -432,36 +448,6 @@ class FlowNSTrainer:
         else:
             self.mapper.update_embeddings(item_emb)
 
-    def _init_flow_runtime(self, item_emb):
-        self._refresh_mapper(item_emb)
-
-        if self.grpo_trainer is None:
-            self.grpo_trainer = GRPOTrainer(
-                flow_model=self.flow_model,
-                sde_sampler=self.sde_sampler,
-                reward_fn=self.reward_fn,
-                mapper=self.mapper,
-                group_size=self.grpo_group_size,
-                clip_eps=self.grpo_clip_eps,
-                beta=self.grpo_beta,
-                lr=self.grpo_lr,
-                max_pos_samples=self.max_pos_samples,
-                log_interval=self.grpo_log_interval,
-                old_policy_scope=self.flow_config.get(
-                    'grpo_old_policy_scope', 'batch',
-                ),
-                normalize_log_ratio=self.flow_config.get(
-                    'grpo_normalize_log_ratio', False,
-                ),
-                reward_mode=self.flow_config.get(
-                    'grpo_reward_mode', 'mapped_item',
-                ),
-                mapping_strategy=self.mapping_strategy,
-                mapping_topk=self.mapping_topk,
-                boundary_safe_w=self.boundary_safe_w,
-                soft_reward_tau=self.soft_reward_tau,
-            )
-
     def _get_pos_embs_for_users(self, user_ids, item_emb):
         K = self.max_pos_samples
         d = item_emb.shape[1]
@@ -516,7 +502,21 @@ class FlowNSTrainer:
             return False
 
         state = torch.load(flow_path, map_location=self.device, weights_only=False)
-        self.flow_model.velocity_net.load_state_dict(state)
+        # strict=False tolerates the CFG null-condition embedding being absent
+        # from pre-CFG checkpoints (it stays at init and is unused when
+        # cfg_guidance_scale == 1) or present in newer ones.
+        load_result = self.flow_model.velocity_net.load_state_dict(
+            state, strict=False,
+        )
+        missing = list(getattr(load_result, 'missing_keys', []))
+        unexpected = list(getattr(load_result, 'unexpected_keys', []))
+        if missing or unexpected:
+            logger.warning(
+                'Phase 2: non-strict flow load (missing=%s, unexpected=%s). '
+                'Expected when loading a pre-CFG flow; retrain with '
+                'cfg_dropout_prob > 0 to use cfg_guidance_scale != 1.',
+                missing, unexpected,
+            )
 
         ref_path = self._resolve_local_path(self.flow_ref_checkpoint_path)
         if ref_path and os.path.exists(ref_path):
@@ -563,7 +563,7 @@ class FlowNSTrainer:
         if self.flow_model.ref_state_dict is None:
             raise RuntimeError(
                 'Flow reference policy is missing. Enable/run flow_pretrain before '
-                'GRPO or flow-based joint training.'
+                'flow-based joint training.'
             )
 
     def _joint_uses_flow_negatives(self):
@@ -571,13 +571,6 @@ class FlowNSTrainer:
             not self.use_random_neg
             and float(self.flow_neg_ratio) > 0.0
             and float(self.joint_exposed_neg_ratio) < 1.0
-        )
-
-    def _joint_uses_grpo(self):
-        return (
-            not self.use_random_neg
-            and self.joint_grpo_steps > 0
-            and self.joint_grpo_freq > 0
         )
 
     def phase2(self):
@@ -591,7 +584,7 @@ class FlowNSTrainer:
         logger.info('=== Phase 2: Flow CFM pretraining ===')
         user_emb, item_emb = get_embeddings(self.rec_model)
         if self._load_flow_checkpoint():
-            self._init_flow_runtime(item_emb)
+            self._refresh_mapper(item_emb)
             return None
 
         self.flow_model.pretrain(
@@ -604,39 +597,16 @@ class FlowNSTrainer:
             stopping_step=self.stopping_step,
         )
         self._save_flow_checkpoint()
-        self._init_flow_runtime(item_emb)
+        self._refresh_mapper(item_emb)
         return None
-
-    def phase3(self):
-        """Phase 3: GRPO fine-tuning of flow model."""
-        self._ensure_rec_ready()
-        if self.use_random_neg:
-            logger.info('=== Phase 3 skipped: RNS control has no flow fine-tuning ===')
-            return
-        if self.grpo_epochs <= 0:
-            logger.info('=== Phase 3 skipped: grpo_epochs <= 0 ===')
-            return
-        self._ensure_flow_ready()
-
-        logger.info('=== Phase 3: GRPO fine-tuning ===')
-        user_emb, item_emb = get_embeddings(self.rec_model)
-        self._init_flow_runtime(item_emb)
-
-        self.grpo_trainer.train(
-            user_emb, item_emb, self.user_pos_items,
-            epochs=self.grpo_epochs,
-            batch_size=self.grpo_batch_size,
-            stopping_step=self.stopping_step,
-        )
 
     def phase4(self):
         """Phase 4: Joint alternating training or RNS finetuning."""
         self._ensure_rec_ready()
         joint_uses_flow = self._joint_uses_flow_negatives()
-        joint_uses_grpo = self._joint_uses_grpo()
         if self.use_random_neg:
             logger.info('=== Phase 4: RNS finetune ===')
-        elif joint_uses_flow or joint_uses_grpo:
+        elif joint_uses_flow:
             self._ensure_flow_ready()
             logger.info('=== Phase 4: Joint training ===')
         else:
@@ -652,6 +622,14 @@ class FlowNSTrainer:
         best_valid_score = float(phase1_score) if phase1_score is not None else -np.inf
         cur_step = 0
 
+        # Console output: verbose mirrors RecBole's training phase (per-epoch
+        # train-loss line, eval line + valid-result dict, progress bars);
+        # concise emits one compact summary line per eval_step.
+        verbose = self.joint_verbose
+        show_progress = verbose and bool(self.config['show_progress'])
+        valid_metric = self.config['valid_metric'].lower()
+        valid_metric_name = self.config['valid_metric']
+
         for epoch in range(self.joint_rec_epochs):
             # (a) Prepare flow state only for flow-generated negatives.
             if self.use_random_neg or not joint_uses_flow:
@@ -666,46 +644,81 @@ class FlowNSTrainer:
 
             # (b) Train rec model one epoch with per-interaction custom negatives
             custom_loss = self._make_custom_loss(user_emb, item_emb)
+            train_start = time.time()
             train_loss = rec_trainer._train_epoch(
-                self.train_data, epoch, loss_func=custom_loss, show_progress=False
+                self.train_data, epoch, loss_func=custom_loss,
+                show_progress=show_progress,
+            )
+            train_end = time.time()
+            if verbose:
+                logger.info(
+                    rec_trainer._generate_train_loss_output(
+                        epoch, train_start, train_end, train_loss,
+                    )
+                )
+
+            if (epoch + 1) % self.eval_step != 0:
+                continue
+
+            # (c) Validate, update early-stopping state, checkpoint on improvement
+            valid_start = time.time()
+            valid_result = rec_trainer.evaluate(
+                self.valid_data, load_best_model=False, show_progress=show_progress,
+            )
+            valid_score = calculate_valid_score(valid_result, valid_metric)
+            valid_end = time.time()
+
+            best_valid_score, cur_step, stop_flag, update_flag = early_stopping(
+                valid_score, best_valid_score, cur_step,
+                max_step=self.stopping_step,
+                bigger=self.config['valid_metric_bigger'],
             )
 
-            if (epoch + 1) % self.eval_step == 0:
-                valid_result = rec_trainer.evaluate(
-                    self.valid_data, load_best_model=False, show_progress=False
-                )
-                valid_score = calculate_valid_score(
-                    valid_result, self.config['valid_metric'].lower()
+            # Order mirrors RecBole: eval line -> valid result -> Saving current.
+            if verbose:
+                logger.info(
+                    (set_color('epoch %d evaluating', 'green') + ' ['
+                     + set_color('time', 'blue') + ': %.2fs, '
+                     + set_color('valid_score', 'blue') + ': %f]')
+                    % (epoch, valid_end - valid_start, valid_score)
                 )
                 logger.info(
-                    f'Phase 4 epoch {epoch+1}/{self.joint_rec_epochs}, '
-                    f'loss={train_loss}, valid={valid_score:.4f}, '
-                    f'best={best_valid_score:.4f}, patience={cur_step}/{self.stopping_step}'
+                    set_color('valid result', 'blue') + ': \n'
+                    + dict2str(valid_result)
                 )
 
-                best_valid_score, cur_step, stop_flag, update_flag = early_stopping(
-                    valid_score, best_valid_score, cur_step,
-                    max_step=self.stopping_step,
-                    bigger=self.config['valid_metric_bigger'],
-                )
-                if update_flag:
-                    rec_trainer._save_checkpoint(epoch)
-                if stop_flag and not self.disable_early_stopping:
-                    logger.info(f'Phase 4 early stopping at epoch {epoch+1}')
-                    break
+            if update_flag:
+                rec_trainer._save_checkpoint(epoch, verbose=verbose)
 
-            # (c) GRPO update every joint_grpo_freq epochs
-            if (
-                joint_uses_grpo
-                and (epoch + 1) % self.joint_grpo_freq == 0
-            ):
-                user_emb, item_emb = get_embeddings(self.rec_model)
-                self._refresh_mapper(item_emb)
-                self.grpo_trainer.train_steps(
-                    user_emb, item_emb, self.user_pos_items,
-                    n_steps=self.joint_grpo_steps,
-                    batch_size=self.grpo_batch_size,
+            if verbose:
+                logger.info(
+                    'Phase 4 best %s: %.4f (patience %d/%d)',
+                    valid_metric_name, best_valid_score, cur_step,
+                    self.stopping_step,
                 )
+            else:
+                loss_str = (
+                    ', '.join(f'{x:.4f}' for x in train_loss)
+                    if isinstance(train_loss, tuple) else f'{train_loss:.4f}'
+                )
+                logger.info(
+                    'Phase 4 epoch %d/%d [train loss: %s, valid %s: %.4f, '
+                    'best: %.4f, patience: %d/%d]',
+                    epoch + 1, self.joint_rec_epochs, loss_str,
+                    valid_metric_name, valid_score, best_valid_score,
+                    cur_step, self.stopping_step,
+                )
+
+            if stop_flag and not self.disable_early_stopping:
+                if verbose:
+                    stop_epoch = epoch - cur_step * self.eval_step
+                    logger.info(
+                        'Phase 4 finished training, best eval result in epoch %d',
+                        stop_epoch,
+                    )
+                else:
+                    logger.info('Phase 4 early stopping at epoch %d', epoch + 1)
+                break
 
         return best_valid_score
 
@@ -1162,7 +1175,6 @@ class FlowNSTrainer:
         phase_methods = {
             'rec_pretrain': self.phase1,
             'flow_pretrain': self.phase2,
-            'grpo': self.phase3,
             'joint': self.phase4,
         }
         for phase in self.enabled_phases:

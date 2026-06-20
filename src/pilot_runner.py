@@ -16,20 +16,14 @@ import yaml
 from .custom_metrics import (
     compute_fn_rate,
     compute_w_statistics,
-    theoretical_fn_bound,
 )
-from .flow_model import ConditionalFlowModel
 from .flowns_trainer import FLOW_CONFIG_DEFAULTS, FlowNSTrainer
-from .grpo import GRPOTrainer
 from .neg_sampling import EmbeddingToItemMapper
 from .recbole_utils import (
     get_embeddings,
     get_user_positive_items,
     setup_recbole,
-    train_recbole,
 )
-from .reward import BoundaryAwareReward
-from .sde_sampler import SDESampler
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -289,8 +283,8 @@ def _run_generation_diagnostics(trainer, sample_users):
         forbidden = [
             trainer.user_pos_items.get(int(uid), set()) for uid in sample_uids
         ]
-        pos_embs, pos_mask = trainer.grpo_trainer._get_pos_embs(
-            sample_uids, item_emb, trainer.user_pos_items,
+        pos_embs, pos_mask = trainer._get_pos_embs_for_users(
+            sample_uids, item_emb,
         )
         mapped_ids = trainer.mapper.map_to_items(
             final_emb,
@@ -421,8 +415,6 @@ def _run_flowns_config(merged_config, dataset, seed=None):
         result.update(quality_result)
     if diagnostic_result:
         result['generation_diagnostics'] = diagnostic_result
-    if trainer.grpo_trainer is not None and trainer.grpo_trainer.history:
-        result['grpo_history'] = trainer.grpo_trainer.history
     return result, trainer
 
 
@@ -463,111 +455,6 @@ def run_experiment(args):
     logger.info('Results saved to %s', out_path)
 
 
-def _measure_fn_rate(flow_model, sde_sampler, mapper, user_emb, user_pos, n_users):
-    flow_model.velocity_net.eval()
-    sample_uids = [u for u in user_pos if u < user_emb.shape[0]][:n_users]
-    sample_uemb = user_emb[sample_uids]
-
-    with torch.no_grad():
-        final_emb, _, _ = sde_sampler.sample_trajectories(
-            sample_uemb, n_trajectories=1,
-        )
-        final_emb = final_emb.squeeze(1)
-        gen_ids = mapper.map_to_items(final_emb)
-
-    return compute_fn_rate(gen_ids, user_pos, sample_uids)
-
-
-def run_fn_guarantee(args):
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-
-    recbole_base, _, _ = _load_experiments()
-    config_dict = _build_recbole_config_dict(
-        recbole_base, args.dataset, {}, seed=args.seed,
-    )
-
-    logger.info('=== M5_fn_guarantee / dataset=%s ===', args.dataset)
-    config, model, dataset, train_data, valid_data, test_data = setup_recbole(
-        'LightGCN', args.dataset,
-        config_dict=config_dict,
-    )
-    train_recbole(config, model, train_data, valid_data)
-    user_emb, item_emb = get_embeddings(model)
-    user_pos = get_user_positive_items(dataset)
-
-    emb_dim = config['embedding_size']
-    flow = ConditionalFlowModel(
-        emb_dim=emb_dim, hidden_dim=256, n_layers=3, device=str(config['device']),
-    )
-    flow.pretrain(
-        user_emb, item_emb, user_pos,
-        epochs=args.flow_epochs, lr=args.flow_lr,
-    )
-
-    sde = SDESampler(flow.velocity_net, n_steps=args.sde_steps, eta=args.eta, delta=args.delta)
-    mapper = EmbeddingToItemMapper(item_emb)
-    reward_fn = BoundaryAwareReward(a=1.0, gamma=1.0)
-
-    fn_ref = _measure_fn_rate(flow, sde, mapper, user_emb, user_pos, args.fn_users)
-    logger.info('Reference policy FN rate: %.6f', fn_ref)
-
-    results_list = []
-    for beta in args.beta_values:
-        logger.info('--- beta=%s ---', beta)
-        flow_beta = ConditionalFlowModel(
-            emb_dim=emb_dim, hidden_dim=256, n_layers=3, device=str(config['device']),
-        )
-        flow_beta.velocity_net.load_state_dict(flow.ref_state_dict)
-        flow_beta.ref_state_dict = {
-            key: value.clone() for key, value in flow.ref_state_dict.items()
-        }
-
-        sde_beta = SDESampler(
-            flow_beta.velocity_net,
-            n_steps=args.sde_steps,
-            eta=args.eta,
-            delta=args.delta,
-        )
-        mapper_beta = EmbeddingToItemMapper(item_emb)
-        grpo = GRPOTrainer(
-            flow_beta, sde_beta, reward_fn, mapper_beta,
-            group_size=8, clip_eps=0.2, beta=beta, lr=1e-4, max_pos_samples=10,
-        )
-        grpo.train(user_emb, item_emb, user_pos, epochs=args.grpo_epochs, batch_size=64)
-
-        fn_actual = _measure_fn_rate(
-            flow_beta, sde_beta, mapper_beta, user_emb, user_pos, args.fn_users,
-        )
-        fn_bound = theoretical_fn_bound(fn_ref, reward_fn.r_max, beta)
-        tightness = (
-            fn_actual / fn_bound
-            if fn_bound > 0 and fn_bound != float('inf')
-            else float('nan')
-        )
-        logger.info(
-            'beta=%s: FN_actual=%.6f, FN_bound=%.6f, tightness=%.4f',
-            beta, fn_actual, fn_bound, tightness,
-        )
-        results_list.append({
-            'beta': beta,
-            'fn_actual': fn_actual,
-            'fn_bound': fn_bound,
-            'tightness_ratio': tightness,
-        })
-
-    result = {
-        'experiment': 'M5_fn_guarantee',
-        'dataset': args.dataset,
-        'fn_ref': fn_ref,
-        'r_max': reward_fn.r_max,
-        'results': results_list,
-    }
-    out_path = RESULTS_DIR / f'{_result_stem("M5_fn_guarantee", args.dataset)}.json'
-    with open(out_path, 'w') as f:
-        json.dump(result, f, indent=2)
-    logger.info('Results saved to %s', out_path)
-
-
 def list_experiments(args):
     """Print available experiment names."""
     _, _, experiments = _load_experiments()
@@ -594,20 +481,6 @@ def build_parser():
                             help='Suffix for the result/flow file names; use to '
                                  'keep sweep runs from overwriting each other')
     run_parser.set_defaults(func=run_experiment)
-
-    fn_parser = subparsers.add_parser('fn-guarantee')
-    fn_parser.add_argument('--dataset', default='mind')
-    fn_parser.add_argument('--seed', type=int, default=None)
-    fn_parser.add_argument('--beta-values', type=float, nargs='+',
-                           default=[0.01, 0.05, 0.1, 0.5, 1.0])
-    fn_parser.add_argument('--flow-epochs', type=int, default=50)
-    fn_parser.add_argument('--flow-lr', type=float, default=1e-4)
-    fn_parser.add_argument('--grpo-epochs', type=int, default=5)
-    fn_parser.add_argument('--sde-steps', type=int, default=20)
-    fn_parser.add_argument('--eta', type=float, default=0.5)
-    fn_parser.add_argument('--delta', type=float, default=0.01)
-    fn_parser.add_argument('--fn-users', type=int, default=2000)
-    fn_parser.set_defaults(func=run_fn_guarantee)
 
     list_parser = subparsers.add_parser('list')
     list_parser.set_defaults(func=list_experiments)

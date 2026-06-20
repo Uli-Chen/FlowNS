@@ -46,6 +46,12 @@ class SinusoidalTimeEmbedding(nn.Module):
 class ConditionalVelocityNet(nn.Module):
     """v_θ(x_t, u, t): predicts velocity field for conditional flow matching.
     Input: concat(x_t, user_emb, t_embed) → MLP → velocity (emb_dim,)
+
+    For classifier-free guidance (CFG) the net also learns the *unconditional*
+    field v_θ(x_t, ∅, t): a learned `null_cond` embedding stands in for the user
+    condition. At train time rows are dropped to ∅ with some probability; at
+    sample time the conditional and unconditional fields are extrapolated
+    (see SDESampler.guidance_scale).
     """
 
     def __init__(self, emb_dim, hidden_dim=256, n_layers=3, time_embed_dim=16):
@@ -65,15 +71,28 @@ class ConditionalVelocityNet(nn.Module):
                 layers.append(nn.SiLU())
         self.net = nn.Sequential(*layers)
 
-    def forward(self, x_t, user_emb, t):
+        # Learned null condition for CFG. Stays at its init (zeros) and is never
+        # read unless conditions are actually dropped, so a flow trained/loaded
+        # without CFG behaves exactly as before.
+        self.null_cond = nn.Parameter(torch.zeros(emb_dim))
+
+    def forward(self, x_t, user_emb, t, cond_drop_mask=None):
         """
         Args:
             x_t: (B, d) noisy embedding at time t
             user_emb: (B, d) user conditioning
             t: (B,) or (B, 1) time in [0, 1]
+            cond_drop_mask: optional (B,) bool tensor. Rows that are True have
+                their conditioning replaced by the learned null embedding — this
+                is how CFG trains the unconditional branch (random drop) and
+                samples it (all-True). None keeps every row conditional (the
+                original behavior, no extra work).
         Returns:
             velocity: (B, d)
         """
+        if cond_drop_mask is not None:
+            null = self.null_cond.to(dtype=user_emb.dtype).expand_as(user_emb)
+            user_emb = torch.where(cond_drop_mask.unsqueeze(-1), null, user_emb)
         t_embed = self.time_embed(t)
         inp = torch.cat([x_t, user_emb, t_embed], dim=-1)
         return self.net(inp)
@@ -82,39 +101,38 @@ class ConditionalVelocityNet(nn.Module):
 class ConditionalFlowModel:
     """Conditional Flow Matching for learning negative item distribution."""
 
-    def __init__(self, emb_dim, hidden_dim=256, n_layers=3, device='cpu'):
+    def __init__(self, emb_dim, hidden_dim=256, n_layers=3, device='cpu',
+                 cfg_dropout_prob=0.0):
         self.emb_dim = emb_dim
         self._hidden_dim = hidden_dim
         self._n_layers = n_layers
         self.device = device
+        # Classifier-free guidance: train-time probability of dropping the user
+        # condition to the learned null embedding. 0.0 disables CFG entirely.
+        self.cfg_dropout_prob = float(cfg_dropout_prob)
         self.velocity_net = ConditionalVelocityNet(
             emb_dim, hidden_dim, n_layers
         ).to(device)
         self.ref_state_dict = None
 
     def save_as_reference(self):
-        """Save current velocity net as π_ref for GRPO KL computation."""
+        """Snapshot the current velocity net as the pretrained reference.
+
+        Used as the "flow has been pretrained" sentinel and persisted as the
+        flow-ref checkpoint so paired runs share one frozen reference policy.
+        """
         self.ref_state_dict = {
             k: v.clone() for k, v in self.velocity_net.state_dict().items()
         }
 
-    def create_ref_net(self):
-        """Create reference net with identical architecture from saved state."""
-        if self.ref_state_dict is None:
-            raise RuntimeError('No reference state saved. Call save_as_reference() first.')
-        net = ConditionalVelocityNet(
-            self.velocity_net.emb_dim,
-            hidden_dim=self._hidden_dim,
-            n_layers=self._n_layers,
-            time_embed_dim=self.velocity_net.time_embed_dim,
-        ).to(self.device)
-        net.load_state_dict(self.ref_state_dict)
-        net.eval()
-        return net
-
     def cfm_loss(self, user_emb, neg_item_emb):
         """Conditional Flow Matching loss.
-        L = E[||v_θ((1-t)x_0 + t·e_n, u, t) - (e_n - x_0)||²]
+        L = E[||v_θ((1-t)x_0 + t·e_n, c, t) - (e_n - x_0)||²]
+
+        With CFG enabled (cfg_dropout_prob > 0), the condition c is the user
+        embedding for most rows but the learned null embedding for a random
+        cfg_dropout_prob fraction, so the same net learns both the conditional
+        and unconditional velocity fields.
 
         Args:
             user_emb: (B, d)
@@ -127,7 +145,15 @@ class ConditionalFlowModel:
         x_t = (1 - t.unsqueeze(-1)) * x_0 + t.unsqueeze(-1) * neg_item_emb
         target_velocity = neg_item_emb - x_0
 
-        pred_velocity = self.velocity_net(x_t, user_emb, t)
+        cond_drop_mask = None
+        if self.cfg_dropout_prob > 0.0:
+            cond_drop_mask = (
+                torch.rand(B, device=neg_item_emb.device) < self.cfg_dropout_prob
+            )
+
+        pred_velocity = self.velocity_net(
+            x_t, user_emb, t, cond_drop_mask=cond_drop_mask,
+        )
         loss = (pred_velocity - target_velocity).pow(2).mean()
         return loss
 

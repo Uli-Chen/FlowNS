@@ -1,7 +1,7 @@
 #!/bin/bash
-# FlowNS staged experiment runner (v2, 2026-06-12).
+# FlowNS staged experiment runner (v3, 2026-06-16; GRPO removed).
 # Wraps `python -m src.pilot_runner run` with stage presets, logging, and a
-# results summary. Stage definitions follow refine-logs/EXPERIMENT_PLAN.md.
+# results summary. Stage definitions follow CLAUDE.md "Experiment focus".
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,14 +22,11 @@ usage() {
 Usage:
   bash scripts/run_experiments.sh [options] STAGE_OR_EXPERIMENT...
 
-Stages (expand to experiment lists; see refine-logs/EXPERIMENT_PLAN.md):
-  s0          S0_m0_lgcn S0_m0_vae                      (baselines + paired M0)
-  s1          S1_flow_* + S1_diag_dot_*                  (flow realness, D0)
-  s2          S2_grpo_{soft,hard}_{vae,lgcn}             (GRPO health, D1/D2)
-  s3vae       S3_{rand,exposed,flow,flowns}_vae          (ranking gate, D3)
-  s3lgcn      S3_{rand,exposed,flow,flowns}_lgcn
-  s4          S4_{boundary,metric_dot,noshape,kl_off}_vae (ablations, gated)
-  vae-chain   S0..S3 primary MultiVAE path in dependency order
+Stages (expand to experiment lists; see CLAUDE.md "Experiment focus"):
+  backbone    S0_m0_lgcn S0_dns_lgcn         (F1: backbone health + headroom)
+  s0          S0_m0_lgcn S0_dns_lgcn         (baseline + paired M0 + DNS control)
+  s1          S1_flow_lgcn                   (F2: flow realness/bridge diagnostics)
+  s3          S3_{rand,exposed,flow,cont}_lgcn (F2: ranking vs paired controls)
   lgcn-chain  S0..S3 LightGCN path in dependency order
   smoke       tiny end-to-end harness check (2-epoch, no pointer/cache pollution)
 
@@ -84,9 +81,8 @@ mkdir -p "$RESULTS_DIR" "$LOG_DIR"
 # Smoke overrides: self-contained (own rec model, own flow cache, no M0
 # pointer writes), tiny epochs. Validates every phase on real data in minutes.
 SMOKE_SETS=(
-    "epochs=2" "stopping_step=2" "flow_pretrain_epochs=2" "grpo_epochs=1"
-    "grpo_batch_size=1024" "joint_rec_epochs=2" "joint_grpo_freq=1"
-    "joint_grpo_steps=1" "diagnostic_sample_users=200" "quality_sample_users=200"
+    "epochs=2" "stopping_step=2" "flow_pretrain_epochs=2"
+    "joint_rec_epochs=2" "diagnostic_sample_users=200" "quality_sample_users=200"
     "use_paired_m0=false" "save_rec_checkpoint_pointer=false"
     "flow_checkpoint_path=results/pilot/smoke_flow.pt"
     "flow_ref_checkpoint_path=results/pilot/smoke_flow_ref.pt"
@@ -94,14 +90,11 @@ SMOKE_SETS=(
 
 expand_stage() {
     case "$1" in
-        s0)         echo "S0_m0_lgcn S0_m0_vae" ;;
-        s1)         echo "S1_flow_lgcn S1_flow_vae S1_diag_dot_lgcn S1_diag_dot_vae" ;;
-        s2)         echo "S2_grpo_soft_vae S2_grpo_hard_vae S2_grpo_soft_lgcn S2_grpo_hard_lgcn" ;;
-        s3vae)      echo "S3_rand_vae S3_exposed_vae S3_flow_vae S3_flowns_vae" ;;
-        s3lgcn)     echo "S3_rand_lgcn S3_exposed_lgcn S3_flow_lgcn S3_flowns_lgcn" ;;
-        s4)         echo "S4_boundary_vae S4_metric_dot_vae S4_noshape_vae S4_kl_off_vae" ;;
-        vae-chain)  echo "S0_m0_vae S1_flow_vae S2_grpo_soft_vae S2_grpo_hard_vae S3_rand_vae S3_exposed_vae S3_flow_vae S3_flowns_vae" ;;
-        lgcn-chain) echo "S0_m0_lgcn S1_flow_lgcn S2_grpo_soft_lgcn S2_grpo_hard_lgcn S3_rand_lgcn S3_exposed_lgcn S3_flow_lgcn S3_flowns_lgcn" ;;
+        backbone)   echo "S0_m0_lgcn S0_dns_lgcn" ;;
+        s0)         echo "S0_m0_lgcn S0_dns_lgcn" ;;
+        s1)         echo "S1_flow_lgcn" ;;
+        s3)         echo "S3_rand_lgcn S3_exposed_lgcn S3_flow_lgcn S3_cont_lgcn" ;;
+        lgcn-chain) echo "S0_m0_lgcn S1_flow_lgcn S3_rand_lgcn S3_exposed_lgcn S3_flow_lgcn S3_cont_lgcn" ;;
         smoke)      echo "__SMOKE__" ;;
         *)          echo "$1" ;;
     esac
@@ -148,7 +141,7 @@ for target in "${TARGETS[@]}"; do
     for experiment in $(expand_stage "$target"); do
         if [ "$experiment" = "__SMOKE__" ]; then
             TAG_SAVED="$TAG"; TAG="smoke"
-            for exp in S0_m0_vae S1_flow_vae S2_grpo_soft_vae S3_flowns_vae; do
+            for exp in S0_m0_lgcn S1_flow_lgcn S3_flow_lgcn S3_cont_lgcn; do
                 run_one "$exp" "${SMOKE_SETS[@]}"
             done
             TAG="$TAG_SAVED"

@@ -122,13 +122,15 @@ def main():
     proj = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     flow_path = flow_path if os.path.isabs(flow_path) else os.path.join(proj, flow_path)
     flow.velocity_net.load_state_dict(
-        torch.load(flow_path, map_location=device, weights_only=False)
+        torch.load(flow_path, map_location=device, weights_only=False),
+        strict=False,  # tolerate the CFG null-condition key being absent/present
     )
     flow.velocity_net.eval()
     logger.info('Loaded cached flow: %s', flow_path)
     sde = SDESampler(
         flow.velocity_net, n_steps=merged.get('sde_steps', 20),
         eta=merged.get('eta', 0.5), delta=merged.get('delta', 0.01),
+        guidance_scale=merged.get('cfg_guidance_scale', 1.0),
     )
 
     train_pos = get_user_positive_items(train_data)

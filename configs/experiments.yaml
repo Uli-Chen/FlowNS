@@ -1,24 +1,33 @@
-# FlowNS experiment registry — v2 (2026-06-12), aligned with FINAL_PROPOSAL.md v2.
+# FlowNS experiment registry — v3 (2026-06-16). GRPO removed.
 #
-# Organization: staged diagnostic chain (see refine-logs/EXPERIMENT_PLAN.md).
-#   S0  baselines + paired-checkpoint sources (one per backbone)
-#   S1  flow CFM pretraining realness/bridge diagnostics (D0)
-#   S2  GRPO dynamics health, soft vs hard reward (D1 + D2-preview)
-#   S3  ranking gain vs paired controls, honest full-sort (D3)
-#   S4  mechanism ablations (run only after the S3 gate passes)
+# Two focuses (see CLAUDE.md "Experiment focus"):
+#   F1  backbone health     — LightGCN metrics land in the normal published range.
+#                             Quick check on ml-100k: run S0_m0_lgcn --dataset ml-100k.
+#   F2  flow effectiveness   — does the CFM flow produce realistic + useful
+#                             negatives BEFORE any RL? RL only makes sense if the
+#                             flow itself already helps. Verified on MIND (the
+#                             exposure dataset) via S1 diagnostics + S3 ranking.
+#
+# Stages:
+#   S0  baselines / paired-M0 sources + a negative-sensitivity control (native DNS)
+#   S1  flow CFM pretraining: realness + bridge diagnostics (fn_rate, W_cont, W_map,
+#       unique_ratio). Caches the flow for S3.
+#   S3  ranking gain vs paired controls, honest full-sort:
+#         M-R   random negatives        (S3_rand)
+#         M-E   exposed negatives direct (S3_exposed)
+#         M-F   flow negatives, discrete (S3_flow)   / continuous (S3_cont)
 #
 # Conventions:
-#   - Dataset defaults to MIND (the only exposure dataset); main conclusions
-#     live there. Run: python -m src.pilot_runner run --experiment <name>
-#   - Paired M0 checkpoints are keyed by (dataset, model): S0 must be run once
-#     per backbone before S1-S4 of that backbone.
-#   - The pretrained flow is cached at results/pilot/S1_flow_<bb>_flow.pt and
-#     reused by S2/S3/S4 (delete the file to force retraining).
-#   - valid_metric is NDCG@20 everywhere (the D3 gate metric).
-#   - GRPO experiments must set grpo_reward_mode explicitly; the code default
-#     stays mapped_item to avoid silent behavior changes.
+#   - Run: python -m src.pilot_runner run --experiment <name> --dataset <mind|ml-100k|kuairand>
+#   - Paired M0 checkpoints are keyed by (dataset, model): run S0_m0_lgcn once per
+#     dataset before S1/S3 of that dataset.
+#   - The pretrained flow is cached per-dataset at
+#     results/pilot/S1_flow_lgcn_flow_<dataset>.pt and reused by S3 (delete to retrain).
+#   - valid_metric = NDCG@20. Honest full-sort only: rerank_* and
+#     eval_exposed_neg_penalty stay 0 (the +40% lesson — never filter at eval).
+#   - All conclusions come from paired controls sharing one M0, never cross-run numbers.
 
-# RecBole Phase 1 parameters (dataset configs e.g. lightgcn_mind.yaml override).
+# RecBole Phase 1 parameters (dataset configs e.g. lightgcn_mind.yaml override these).
 recbole:
   embedding_size: 64
   metrics: [Recall, NDCG, Hit, MRR]
@@ -46,56 +55,62 @@ recbole:
   use_gpu: true
   checkpoint_dir: saved/
 
-# FlowNS Phases 2-4 defaults (mirror src/flowns_trainer.py FLOW_CONFIG_DEFAULTS).
+# FlowNS Phase 2 (flow) + Phase 4 (joint) defaults (mirror FLOW_CONFIG_DEFAULTS).
 defaults:
-  # Flow model
+  # Flow model (CFM)
   flow_hidden_dim: 256
   flow_n_layers: 3
   flow_pretrain_epochs: 200
   flow_pretrain_batch_size: 256
   flow_lr: 1.e-4
-  flow_log_interval: 10
+  flow_log_interval: 1
   flow_checkpoint_path:
   flow_ref_checkpoint_path:
 
-  # SDE sampler (post-fix: correct Tweedie + step-averaged sigma; the stability
-  # knobs below stay 0/None unless an explosion is actually observed)
+  # Flow sampler. eta=0 => deterministic Euler ODE (dx = v dt): the Tweedie
+  # score term and the injected noise both vanish, so generation uses exactly
+  # the trained velocity field. eta>0 reactivates the Euler-Maruyama SDE (built
+  # for flow-GRPO, now removed). delta/sde_sigma_min/sde_score_clamp only matter
+  # when eta>0.
   sde_steps: 20
-  eta: 0.5
+  eta: 0.0
   delta: 0.01
   sde_sigma_min: 0.0
   sde_score_clamp:
 
-  # GRPO
-  grpo_epochs: 10
-  grpo_group_size: 8
-  grpo_clip_eps: 0.2
-  grpo_beta: 0.1
-  grpo_lr: 1.e-4
-  # 256 users x G=8 trajectories fits the 8GB laptop GPU and cuts batches/epoch
-  # 4x vs the old 64; group-relative advantages are per-user so stats unchanged.
-  grpo_batch_size: 256
-  grpo_log_interval: 1
-  grpo_old_policy_scope: batch
-  grpo_normalize_log_ratio: false
-  grpo_reward_mode: mapped_item
-  soft_reward_tau: 0.1
+  # Classifier-free guidance (CFG). The flow generates item embeddings
+  # conditioned on the user embedding; CFG controls how strongly generation
+  # follows that condition.
+  #   cfg_dropout_prob   train-time prob. of replacing the user condition with a
+  #                      learned null embedding, so the net also learns the
+  #                      unconditional field v(x, ∅, t). 0.0 disables CFG.
+  #   cfg_guidance_scale sampling weight w in  v = v_uncond + w·(v_cond - v_uncond):
+  #                        1.0 = plain conditional (single forward pass, no guidance)
+  #                        >1  = sharpen user conditioning (harder/more user-specific,
+  #                              less diverse negatives), e.g. sweep 1.5 / 2.0 / 3.0
+  #                        0   = unconditional
+  # NOTE: guidance only bites if the flow was trained with cfg_dropout_prob > 0.
+  # Changing cfg_dropout_prob means deleting the cached flow (.pt) to retrain.
+  cfg_dropout_prob: 0.01
+  cfg_guidance_scale: 10.0
 
-  # Reward
+  # Boundary-aware hardness reward R = W^a(1-W)^gamma. No longer drives GRPO;
+  # only used by the FN-safe bridge strategies (reward_topk / boundary_topk).
   reward_a: 1.0
   reward_gamma: 1.0
 
-  # Joint phase
+  # Joint phase (co-train recommender with flow/exposed/random negatives)
   joint_rec_epochs: 100
-  joint_grpo_freq: 5
-  joint_grpo_steps: 2
   joint_num_negatives: 1
   joint_exposed_neg_ratio: 0.0
   flow_neg_ratio: 1.0
   flow_neg_loss_weight: 0.1
-  eval_step: 1
+  eval_step: 1            # validate once per epoch
   stopping_step: 10
   max_pos_samples: 10
+  # Phase 4 console output: true (详细) = RecBole-style lines + progress bars;
+  # false (简略) = one compact summary line per eval_step.
+  joint_verbose: true
 
   # Continuous -> discrete bridge
   mapping_strategy: nearest
@@ -113,52 +128,24 @@ defaults:
   evaluate_test: true
   diagnostic_sample_users: 1000
 
-# Shared MultiVAE backbone settings (validated in rounds 6-9).
-x-vae-base: &vae_base
-  model: MultiVAE
-  epochs: 80
-  train_batch_size: 512
-  eval_batch_size: 409600
-  train_neg_sample_args:
-  mlp_hidden_size: [600]
-  latent_dimension: 128
-  dropout_prob: 0.5
-  anneal_cap: 0.2
-  total_anneal_steps: 200000
-  flow_pretrain_epochs: 120
-  flow_pretrain_batch_size: 512
-  joint_rec_epochs: 40
-  joint_lr: 1.e-4
-
-# Shared "load cached flow" blocks.
+# Shared "load cached flow" block (path is auto-keyed by dataset in pilot_runner).
 x-flow-cache-lgcn: &flow_cache_lgcn
   flow_checkpoint_path: results/pilot/S1_flow_lgcn_flow.pt
   flow_ref_checkpoint_path: results/pilot/S1_flow_lgcn_flow_ref.pt
 
-x-flow-cache-vae: &flow_cache_vae
-  flow_checkpoint_path: results/pilot/S1_flow_vae_flow.pt
-  flow_ref_checkpoint_path: results/pilot/S1_flow_vae_flow_ref.pt
-
 experiments:
-  # ============ S0: baselines / paired-checkpoint sources ============
+  # ============ S0: baselines / paired-M0 sources ============
   S0_m0_lgcn:
-    description: LightGCN baseline (uniform negatives); paired-M0 source for the lgcn line.
+    description: LightGCN baseline (uniform negatives); paired-M0 source. Also the F1 backbone check (run with --dataset ml-100k).
     phases: [rec_pretrain]
     save_rec_checkpoint_pointer: true
 
-  S0_m0_vae:
-    description: MultiVAE baseline; paired-M0 source for the vae line.
-    <<: *vae_base
-    phases: [rec_pretrain]
-    save_rec_checkpoint_pointer: true
-
-  # Sanity control: is MIND/LightGCN negative-sensitive AT ALL? Plain LightGCN
-  # with RecBole's native dynamic negative sampling (DNS): per positive, draw
-  # candidate_num uniform candidates, score with the live model, take the
-  # hardest. If this can't beat uniform (S0_m0_lgcn 0.1231) either, then no
-  # negative sampler helps on this dataset and the flatlines aren't our method.
+  # Negative-sensitivity control: native RecBole dynamic negative sampling (DNS).
+  # Per positive, draw candidate_num uniform candidates, score with the live model,
+  # keep the hardest. If DNS cannot beat uniform, the dataset is not negative-
+  # sensitive and no sampler (incl. flow) can help — so this bounds the headroom.
   S0_dns_lgcn:
-    description: Plain LightGCN + native DNS (candidate_num=10). Negative-sensitivity control.
+    description: Plain LightGCN + native DNS (candidate_num=10). Headroom / negative-sensitivity control.
     phases: [rec_pretrain]
     train_neg_sample_args:
       distribution: uniform
@@ -166,124 +153,25 @@ experiments:
       dynamic: True
       candidate_num: 10
 
-  # ============ S1: flow realness + bridge diagnostics (D0) ============
+  # ============ S1: flow realness + bridge diagnostics (F2 step 1) ============
+  # Pretrain the CFM flow on exposed (real) negatives, then report fn_rate /
+  # W_continuous / W_mapped / mapped_unique_ratio. dot mapping is the default here:
+  # the bridge probe showed dot recovers hardness on LightGCN while cosine collapses
+  # it (W_map 0.72 vs 0.20). Caches the flow for the S3 arms.
   S1_flow_lgcn:
-    description: Exposed-negative flow CFM on LightGCN embeddings + realness/bridge diagnostics; caches the flow.
-    phases: [rec_pretrain, flow_pretrain]
-    use_paired_m0: true
-    negative_source: exposed
-    <<: *flow_cache_lgcn
-    evaluate_test: false
-    quality_check: true
-    quality_sample_users: 1000
-
-  S1_flow_vae:
-    description: Exposed-negative flow CFM on MultiVAE decoder space + diagnostics; caches the flow.
-    <<: [*vae_base, *flow_cache_vae]
-    phases: [rec_pretrain, flow_pretrain]
-    use_paired_m0: true
-    negative_source: exposed
-    evaluate_test: false
-    quality_check: true
-    quality_sample_users: 1000
-
-  S1_diag_dot_lgcn:
-    description: Diagnostics-only rerun of S1_flow_lgcn with dot-product mapping (bridge metric-consistency check).
+    description: Exposed-negative flow CFM on LightGCN + realness/bridge diagnostics; caches the flow.
     phases: [rec_pretrain, flow_pretrain]
     use_paired_m0: true
     negative_source: exposed
     <<: *flow_cache_lgcn
     mapping_metric: dot
     evaluate_test: false
+    quality_check: true
+    quality_sample_users: 1000
 
-  S1_diag_dot_vae:
-    description: Diagnostics-only rerun of S1_flow_vae with dot-product mapping.
-    <<: [*vae_base, *flow_cache_vae]
-    phases: [rec_pretrain, flow_pretrain]
-    use_paired_m0: true
-    negative_source: exposed
-    mapping_metric: dot
-    evaluate_test: false
-
-  # ============ S2: GRPO dynamics health (D1 + D2 preview) ============
-  # Frozen recommender, cached flow, no joint phase. Gate on grpo_history:
-  # reward up, KL bounded, |log_ratio| sane; diagnostics give post-GRPO W_mapped.
-  S2_grpo_soft_lgcn:
-    description: GRPO with soft_topk expected reward on LightGCN (the P1a mechanism).
-    phases: [rec_pretrain, flow_pretrain, grpo]
-    use_paired_m0: true
-    negative_source: exposed
-    <<: *flow_cache_lgcn
-    grpo_reward_mode: soft_topk
-    evaluate_test: false
-
-  S2_grpo_hard_lgcn:
-    description: GRPO with hard argmax mapped_item reward (piecewise-constant control arm).
-    phases: [rec_pretrain, flow_pretrain, grpo]
-    use_paired_m0: true
-    negative_source: exposed
-    <<: *flow_cache_lgcn
-    grpo_reward_mode: mapped_item
-    evaluate_test: false
-
-  S2_grpo_soft_vae:
-    description: GRPO with soft_topk expected reward on MultiVAE.
-    <<: [*vae_base, *flow_cache_vae]
-    phases: [rec_pretrain, flow_pretrain, grpo]
-    use_paired_m0: true
-    negative_source: exposed
-    grpo_reward_mode: soft_topk
-    evaluate_test: false
-
-  S2_grpo_hard_vae:
-    description: GRPO with hard mapped_item reward on MultiVAE (control arm).
-    <<: [*vae_base, *flow_cache_vae]
-    phases: [rec_pretrain, flow_pretrain, grpo]
-    use_paired_m0: true
-    negative_source: exposed
-    grpo_reward_mode: mapped_item
-    evaluate_test: false
-
-  # ============ S3: ranking gain vs paired controls (D3) ============
-  # All four arms start from the SAME paired M0; honest full-sort eval.
-  # vae line (primary: exposure design lives here, prior numbers exist)
-  S3_rand_vae:
-    description: Paired control M-R — random-negative BPR penalty, no flow, no GRPO.
-    <<: *vae_base
-    phases: [rec_pretrain, joint]
-    use_paired_m0: true
-    use_random_neg: true
-
-  S3_exposed_vae:
-    description: Paired control M-E — exposed negatives sampled directly, no flow.
-    <<: *vae_base
-    phases: [rec_pretrain, joint]
-    use_paired_m0: true
-    negative_source: exposed
-    joint_exposed_neg_ratio: 1.0
-    flow_neg_ratio: 0.0
-    joint_grpo_freq: 0
-    joint_grpo_steps: 0
-
-  S3_flow_vae:
-    description: M-F — exposed-flow negatives (nearest mapping), no GRPO.
-    <<: [*vae_base, *flow_cache_vae]
-    phases: [rec_pretrain, flow_pretrain, joint]
-    use_paired_m0: true
-    negative_source: exposed
-    grpo_epochs: 0
-    joint_grpo_freq: 0
-    joint_grpo_steps: 0
-
-  S3_flowns_vae:
-    description: M-FG — full FlowNS, GRPO with soft_topk reward + joint training.
-    <<: [*vae_base, *flow_cache_vae]
-    phases: [rec_pretrain, flow_pretrain, grpo, joint]
-    use_paired_m0: true
-    negative_source: exposed
-    grpo_reward_mode: soft_topk
-
-  # lgcn line (secondary)
+  # ============ S3: ranking gain vs paired controls (F2 step 2) ============
+  # All arms start from the SAME paired M0; honest full-sort eval. Compare only
+  # against these paired controls, never against cross-run numbers.
   S3_rand_lgcn:
     description: Paired control M-R — continue LightGCN with RecBole uniform negatives.
     phases: [rec_pretrain, joint]
@@ -297,158 +185,22 @@ experiments:
     negative_source: exposed
     joint_exposed_neg_ratio: 1.0
     flow_neg_ratio: 0.0
-    joint_grpo_freq: 0
-    joint_grpo_steps: 0
 
   S3_flow_lgcn:
-    description: M-F — exposed-flow negatives (nearest mapping), no GRPO.
+    description: M-F — exposed-flow discrete negatives (dot-nearest mapping), no RL.
     phases: [rec_pretrain, flow_pretrain, joint]
     use_paired_m0: true
     negative_source: exposed
     <<: *flow_cache_lgcn
-    grpo_epochs: 0
-    joint_grpo_freq: 0
-    joint_grpo_steps: 0
+    mapping_metric: dot
 
-  S3_flowns_lgcn:
-    description: M-FG — full FlowNS on LightGCN, soft_topk GRPO + joint.
-    phases: [rec_pretrain, flow_pretrain, grpo, joint]
-    use_paired_m0: true
-    negative_source: exposed
-    <<: *flow_cache_lgcn
-    grpo_reward_mode: soft_topk
-
-  # ---- continuous-negative arm (continuous-neg branch) ----
-  # Skip the discrete bridge entirely: BPR scores u·x_gen on the raw flow
-  # embedding. A synthetic embedding is not a held-out item, so it cannot be an
-  # exact discrete false negative — the failure mode (FN poisoning) that crashed
-  # the discrete fine-tune (valid 0.105->0.063). Reuses the S1 cached flow.
+  # Continuous variant — BPR scores u·x_gen on the raw flow embedding, no discrete
+  # bridge. A synthetic embedding cannot be an exact discrete false negative, so it
+  # sidesteps the FN-poisoning crash the discrete fine-tune hit on a converged M0.
   S3_cont_lgcn:
-    description: Continuous flow negatives (u·x_gen direct BPR), frozen flow, no GRPO.
+    description: M-F(cont) — continuous flow negatives (u·x_gen direct BPR), no bridge, no RL.
     phases: [rec_pretrain, flow_pretrain, joint]
     use_paired_m0: true
     negative_source: exposed
     <<: *flow_cache_lgcn
     joint_negative_mode: continuous
-    grpo_epochs: 0
-    joint_grpo_freq: 0
-    joint_grpo_steps: 0
-
-  S3_cont_grpo_lgcn:
-    description: Continuous flow negatives + GRPO (reward_mode=continuous targets W≈0.5).
-    phases: [rec_pretrain, flow_pretrain, grpo, joint]
-    use_paired_m0: true
-    negative_source: exposed
-    <<: *flow_cache_lgcn
-    joint_negative_mode: continuous
-    grpo_reward_mode: continuous
-
-  # Headroom test: do NOT start from a converged M0. Short uniform warmup (10 ep,
-  # well before the epoch-32 convergence), pretrain the flow on those embeddings,
-  # then co-train with continuous flow negatives. Fresh flow (no S1 cache). The
-  # uniform-converged ceiling to beat is S0_m0_lgcn ndcg@20 0.1231.
-  S3_cont_scratch_lgcn:
-    description: From-scratch continuous FlowNS — 10-ep warmup then continuous co-training (headroom test).
-    phases: [rec_pretrain, flow_pretrain, joint]
-    use_paired_m0: false
-    negative_source: exposed
-    epochs: 10
-    flow_pretrain_epochs: 120
-    joint_negative_mode: continuous
-    joint_rec_epochs: 150
-    grpo_epochs: 0
-    joint_grpo_freq: 0
-    joint_grpo_steps: 0
-
-  S3_cont_scratch_grpo_lgcn:
-    description: From-scratch continuous FlowNS + GRPO (reward continuous, W≈0.5) co-trained.
-    phases: [rec_pretrain, flow_pretrain, grpo, joint]
-    use_paired_m0: false
-    negative_source: exposed
-    epochs: 10
-    flow_pretrain_epochs: 120
-    joint_negative_mode: continuous
-    grpo_reward_mode: continuous
-    joint_rec_epochs: 150
-
-  # ---- DNS-style selection: realness isolation (flow pool vs uniform pool) ----
-  # Hardness is identical (hardest-of-k by the LIVE model); only the candidate
-  # POOL differs. flow vs uniform isolates exactly the realness contribution.
-  # Both from-scratch (10-ep warmup, joint 150), batch 4096 to bound the mapping
-  # cost. External reference: native DNS S0_dns_lgcn = +1.54%.
-  S3_dnsflow_lgcn:
-    description: Flow candidate pool + live FN-safe hardest selection (the realness contribution).
-    phases: [rec_pretrain, flow_pretrain, joint]
-    use_paired_m0: false
-    negative_source: exposed
-    epochs: 10
-    flow_pretrain_epochs: 120
-    train_batch_size: 4096
-    joint_negative_mode: dns
-    dns_candidate_source: flow
-    dns_candidate_num: 10
-    dns_safe_selection: true
-    mapping_metric: dot
-    joint_rec_epochs: 150
-    grpo_epochs: 0
-    joint_grpo_freq: 0
-    joint_grpo_steps: 0
-
-  S3_dnsuniform_lgcn:
-    description: Uniform candidate pool + DNS hardest-of-k (protocol-matched vanilla DNS control).
-    phases: [rec_pretrain, joint]
-    use_paired_m0: false
-    epochs: 10
-    train_batch_size: 4096
-    joint_negative_mode: dns
-    dns_candidate_source: uniform
-    dns_candidate_num: 10
-    flow_neg_ratio: 0.0
-    joint_rec_epochs: 150
-    grpo_epochs: 0
-    joint_grpo_freq: 0
-    joint_grpo_steps: 0
-
-  # ============ S4: mechanism ablations (gated on S3) ============
-  S4_boundary_vae:
-    description: Bridge alternative — boundary_topk FN-safe hardness mapping, no GRPO (Round-10 arm).
-    <<: [*vae_base, *flow_cache_vae]
-    phases: [rec_pretrain, flow_pretrain, joint]
-    use_paired_m0: true
-    negative_source: exposed
-    grpo_epochs: 0
-    joint_grpo_freq: 0
-    joint_grpo_steps: 0
-    mapping_strategy: boundary_topk
-    mapping_topk: 100
-    boundary_safe_w: 0.5
-    # a>gamma keeps the reward monotonic on the safe region [0, 0.5]
-    reward_a: 2.0
-    reward_gamma: 1.0
-
-  S4_metric_dot_vae:
-    description: Metric-consistency ablation — full FlowNS with dot-product mapping end to end.
-    <<: [*vae_base, *flow_cache_vae]
-    phases: [rec_pretrain, flow_pretrain, grpo, joint]
-    use_paired_m0: true
-    negative_source: exposed
-    grpo_reward_mode: soft_topk
-    mapping_metric: dot
-
-  S4_noshape_vae:
-    description: Claim-2B ablation — R = W (no boundary shaping, gamma=0) with soft_topk.
-    <<: [*vae_base, *flow_cache_vae]
-    phases: [rec_pretrain, flow_pretrain, grpo, joint]
-    use_paired_m0: true
-    negative_source: exposed
-    grpo_reward_mode: soft_topk
-    reward_gamma: 0.0
-
-  S4_kl_off_vae:
-    description: Claim-3 ablation — beta=0 removes the KL anchor (expect FN drift).
-    <<: [*vae_base, *flow_cache_vae]
-    phases: [rec_pretrain, flow_pretrain, grpo, joint]
-    use_paired_m0: true
-    negative_source: exposed
-    grpo_reward_mode: soft_topk
-    grpo_beta: 0.0

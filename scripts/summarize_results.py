@@ -2,13 +2,12 @@
 """Summarize FlowNS results/pilot/*.json into one comparison table.
 
 Usage:
-  python scripts/summarize_results.py [--dataset mind] [--baseline S0_m0_vae]
+  python scripts/summarize_results.py [--dataset mind] [--baseline S0_m0_lgcn]
                                       [--filter S3_] [--sort ndcg]
 
-Columns map onto the diagnostic chain (refine-logs/EXPERIMENT_PLAN.md):
-  D1: grpo reward first->last, kl_last, max|log r|
-  D2: W_cont / W_map / uniq / FN (generation diagnostics, post-mask-fix)
-  D3: valid + test NDCG@20 / Recall@20 (honest full-sort), Δ vs --baseline
+Columns (see CLAUDE.md "Experiment focus"):
+  realness: W_cont / W_map / FN / W>.8 (generation diagnostics, post-mask-fix)
+  ranking:  valid + test NDCG@20 / Recall@20 (honest full-sort), Δ vs --baseline
 """
 import argparse
 import json
@@ -47,14 +46,6 @@ def _load_rows(dataset_filter, name_filter):
         w_map_hi = (diag.get('w_mapped') or {}).get('pct_above_0.8')
         fn = diag.get('fn_rate_all_known', data.get('fn_rate'))
 
-        grpo = [h for h in data.get('grpo_history', [])
-                if h.get('phase') == 'grpo']
-        r_first = grpo[0].get('reward_mean') if grpo else None
-        r_last = grpo[-1].get('reward_mean') if grpo else None
-        kl_last = grpo[-1].get('kl_mean') if grpo else None
-        logr_max = max((h.get('log_ratio_abs_mean', 0.0) for h in grpo),
-                       default=None) if grpo else None
-
         rows.append({
             'stem': stem,
             'model': data.get('model', '?'),
@@ -66,10 +57,6 @@ def _load_rows(dataset_filter, name_filter):
             'w_cont': w_cont,
             'w_map': w_map,
             'w_map_hi': w_map_hi,
-            'r_first': r_first,
-            'r_last': r_last,
-            'kl_last': kl_last,
-            'logr_max': logr_max,
         })
     return rows
 
@@ -108,8 +95,7 @@ def main():
         f"{'run'.ljust(name_w)} {'seed'.rjust(5)} "
         f"{'valid'.rjust(8)} {'ndcg@20'.rjust(8)} {'Δ%'.rjust(7)} "
         f"{'rec@20'.rjust(8)} {'FN'.rjust(8)} "
-        f"{'W_cont'.rjust(8)} {'W_map'.rjust(8)} {'W>.8'.rjust(6)} "
-        f"{'R 1st'.rjust(8)} {'R last'.rjust(8)} {'KL'.rjust(8)} {'|logr|'.rjust(9)}"
+        f"{'W_cont'.rjust(8)} {'W_map'.rjust(8)} {'W>.8'.rjust(6)}"
     )
     print(header)
     print('-' * len(header))
@@ -122,9 +108,7 @@ def main():
             f"{_fmt(r['valid'])} {_fmt(r['ndcg20'])} {delta} "
             f"{_fmt(r['recall20'])} {_fmt(r['fn'], prec=4)} "
             f"{_fmt(r['w_cont'])} {_fmt(r['w_map'])} "
-            f"{_fmt(r['w_map_hi'], width=6, prec=2)} "
-            f"{_fmt(r['r_first'])} {_fmt(r['r_last'])} {_fmt(r['kl_last'])} "
-            f"{_fmt(r['logr_max'], width=9, prec=2)}"
+            f"{_fmt(r['w_map_hi'], width=6, prec=2)}"
         )
 
 

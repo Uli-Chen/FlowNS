@@ -1,0 +1,206 @@
+# FlowNS experiment registry — v3 (2026-06-16). GRPO removed.
+#
+# Two focuses (see CLAUDE.md "Experiment focus"):
+#   F1  backbone health     — LightGCN metrics land in the normal published range.
+#                             Quick check on ml-100k: run S0_m0_lgcn --dataset ml-100k.
+#   F2  flow effectiveness   — does the CFM flow produce realistic + useful
+#                             negatives BEFORE any RL? RL only makes sense if the
+#                             flow itself already helps. Verified on MIND (the
+#                             exposure dataset) via S1 diagnostics + S3 ranking.
+#
+# Stages:
+#   S0  baselines / paired-M0 sources + a negative-sensitivity control (native DNS)
+#   S1  flow CFM pretraining: realness + bridge diagnostics (fn_rate, W_cont, W_map,
+#       unique_ratio). Caches the flow for S3.
+#   S3  ranking gain vs paired controls, honest full-sort:
+#         M-R   random negatives        (S3_rand)
+#         M-E   exposed negatives direct (S3_exposed)
+#         M-F   flow negatives, discrete (S3_flow)   / continuous (S3_cont)
+#
+# Conventions:
+#   - Run: python -m src.pilot_runner run --experiment <name> --dataset <mind|ml-100k|kuairand>
+#   - Paired M0 checkpoints are keyed by (dataset, model): run S0_m0_lgcn once per
+#     dataset before S1/S3 of that dataset.
+#   - The pretrained flow is cached per-dataset at
+#     results/pilot/S1_flow_lgcn_flow_<dataset>.pt and reused by S3 (delete to retrain).
+#   - valid_metric = NDCG@20. Honest full-sort only: rerank_* and
+#     eval_exposed_neg_penalty stay 0 (the +40% lesson — never filter at eval).
+#   - All conclusions come from paired controls sharing one M0, never cross-run numbers.
+
+# RecBole Phase 1 parameters (dataset configs e.g. lightgcn_mind.yaml override these).
+recbole:
+  embedding_size: 64
+  metrics: [Recall, NDCG, Hit, MRR]
+  topk: [10, 20]
+  valid_metric: NDCG@20
+  valid_metric_bigger: true
+  eval_args:
+    split:
+      RS: [0.8, 0.1, 0.1]
+    mode: full
+    order: RO
+  learner: adam
+  learning_rate: 0.001
+  epochs: 500
+  train_batch_size: 20480
+  eval_batch_size: 4096000
+  eval_step: 1
+  weight_decay: 0.0
+  train_neg_sample_args:
+    distribution: uniform
+    sample_num: 1
+  seed: 2020
+  reproducibility: true
+  show_progress: true
+  use_gpu: true
+  checkpoint_dir: saved/
+
+# FlowNS Phase 2 (flow) + Phase 4 (joint) defaults (mirror FLOW_CONFIG_DEFAULTS).
+defaults:
+  # Flow model (CFM)
+  flow_hidden_dim: 256
+  flow_n_layers: 3
+  flow_pretrain_epochs: 200
+  flow_pretrain_batch_size: 256
+  flow_lr: 1.e-4
+  flow_log_interval: 1
+  flow_checkpoint_path:
+  flow_ref_checkpoint_path:
+
+  # Flow sampler. eta=0 => deterministic Euler ODE (dx = v dt): the Tweedie
+  # score term and the injected noise both vanish, so generation uses exactly
+  # the trained velocity field. eta>0 reactivates the Euler-Maruyama SDE (built
+  # for flow-GRPO, now removed). delta/sde_sigma_min/sde_score_clamp only matter
+  # when eta>0.
+  sde_steps: 20
+  eta: 0.0
+  delta: 0.01
+  sde_sigma_min: 0.0
+  sde_score_clamp:
+
+  # Classifier-free guidance (CFG). The flow generates item embeddings
+  # conditioned on the user embedding; CFG controls how strongly generation
+  # follows that condition.
+  #   cfg_dropout_prob   train-time prob. of replacing the user condition with a
+  #                      learned null embedding, so the net also learns the
+  #                      unconditional field v(x, ∅, t). 0.0 disables CFG.
+  #   cfg_guidance_scale sampling weight w in  v = v_uncond + w·(v_cond - v_uncond):
+  #                        1.0 = plain conditional (single forward pass, no guidance)
+  #                        >1  = sharpen user conditioning (harder/more user-specific,
+  #                              less diverse negatives), e.g. sweep 1.5 / 2.0 / 3.0
+  #                        0   = unconditional
+  # NOTE: guidance only bites if the flow was trained with cfg_dropout_prob > 0.
+  # Changing cfg_dropout_prob means deleting the cached flow (.pt) to retrain.
+  cfg_dropout_prob: 0.01
+  cfg_guidance_scale: 10.0
+
+  # Boundary-aware hardness reward R = W^a(1-W)^gamma. No longer drives GRPO;
+  # only used by the FN-safe bridge strategies (reward_topk / boundary_topk).
+  reward_a: 1.0
+  reward_gamma: 1.0
+
+  # Joint phase (co-train recommender with flow/exposed/random negatives)
+  joint_rec_epochs: 100
+  joint_num_negatives: 1
+  joint_exposed_neg_ratio: 0.0
+  flow_neg_ratio: 1.0
+  flow_neg_loss_weight: 0.1
+  eval_step: 1            # validate once per epoch
+  stopping_step: 10
+  max_pos_samples: 10
+  # Phase 4 console output: true (详细) = RecBole-style lines + progress bars;
+  # false (简略) = one compact summary line per eval_step.
+  joint_verbose: true
+
+  # Continuous -> discrete bridge
+  mapping_strategy: nearest
+  mapping_topk: 50
+  mapping_metric: cosine
+  boundary_safe_w: 0.5
+  mapper_chunk_size: 16384
+  negative_source: random
+
+  # Eval-time machinery: keep OFF for honest full-sort (the +40% lesson)
+  rerank_num_negatives: 0
+  rerank_neg_penalty: 0.0
+  eval_exposed_neg_penalty: 0.0
+
+  evaluate_test: true
+  diagnostic_sample_users: 1000
+
+# Shared "load cached flow" block (path is auto-keyed by dataset in pilot_runner).
+x-flow-cache-lgcn: &flow_cache_lgcn
+  flow_checkpoint_path: results/pilot/S1_flow_lgcn_flow.pt
+  flow_ref_checkpoint_path: results/pilot/S1_flow_lgcn_flow_ref.pt
+
+experiments:
+  # ============ S0: baselines / paired-M0 sources ============
+  S0_m0_lgcn:
+    description: LightGCN baseline (uniform negatives); paired-M0 source. Also the F1 backbone check (run with --dataset ml-100k).
+    phases: [rec_pretrain]
+    save_rec_checkpoint_pointer: true
+
+  # Negative-sensitivity control: native RecBole dynamic negative sampling (DNS).
+  # Per positive, draw candidate_num uniform candidates, score with the live model,
+  # keep the hardest. If DNS cannot beat uniform, the dataset is not negative-
+  # sensitive and no sampler (incl. flow) can help — so this bounds the headroom.
+  S0_dns_lgcn:
+    description: Plain LightGCN + native DNS (candidate_num=10). Headroom / negative-sensitivity control.
+    phases: [rec_pretrain]
+    train_neg_sample_args:
+      distribution: uniform
+      sample_num: 1
+      dynamic: True
+      candidate_num: 10
+
+  # ============ S1: flow realness + bridge diagnostics (F2 step 1) ============
+  # Pretrain the CFM flow on exposed (real) negatives, then report fn_rate /
+  # W_continuous / W_mapped / mapped_unique_ratio. dot mapping is the default here:
+  # the bridge probe showed dot recovers hardness on LightGCN while cosine collapses
+  # it (W_map 0.72 vs 0.20). Caches the flow for the S3 arms.
+  S1_flow_lgcn:
+    description: Exposed-negative flow CFM on LightGCN + realness/bridge diagnostics; caches the flow.
+    phases: [rec_pretrain, flow_pretrain]
+    use_paired_m0: true
+    negative_source: exposed
+    <<: *flow_cache_lgcn
+    mapping_metric: dot
+    evaluate_test: false
+    quality_check: true
+    quality_sample_users: 1000
+
+  # ============ S3: ranking gain vs paired controls (F2 step 2) ============
+  # All arms start from the SAME paired M0; honest full-sort eval. Compare only
+  # against these paired controls, never against cross-run numbers.
+  S3_rand_lgcn:
+    description: Paired control M-R — continue LightGCN with RecBole uniform negatives.
+    phases: [rec_pretrain, joint]
+    use_paired_m0: true
+    use_random_neg: true
+
+  S3_exposed_lgcn:
+    description: Paired control M-E — exposed negatives sampled directly, no flow.
+    phases: [rec_pretrain, joint]
+    use_paired_m0: true
+    negative_source: exposed
+    joint_exposed_neg_ratio: 1.0
+    flow_neg_ratio: 0.0
+
+  S3_flow_lgcn:
+    description: M-F — exposed-flow discrete negatives (dot-nearest mapping), no RL.
+    phases: [rec_pretrain, flow_pretrain, joint]
+    use_paired_m0: true
+    negative_source: exposed
+    <<: *flow_cache_lgcn
+    mapping_metric: dot
+
+  # Continuous variant — BPR scores u·x_gen on the raw flow embedding, no discrete
+  # bridge. A synthetic embedding cannot be an exact discrete false negative, so it
+  # sidesteps the FN-poisoning crash the discrete fine-tune hit on a converged M0.
+  S3_cont_lgcn:
+    description: M-F(cont) — continuous flow negatives (u·x_gen direct BPR), no bridge, no RL.
+    phases: [rec_pretrain, flow_pretrain, joint]
+    use_paired_m0: true
+    negative_source: exposed
+    <<: *flow_cache_lgcn
+    joint_negative_mode: continuous

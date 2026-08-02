@@ -1,0 +1,55 @@
+{
+  "created_at": "2026-08-02T08:51:30+08:00",
+  "environment": {
+    "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+    "driver": "580.173.02",
+    "cuda": "13.0",
+    "pytorch": "2.13.0+cu130"
+  },
+  "dataset": {
+    "name": "Zhihu",
+    "users": 16015,
+    "items": 45782,
+    "train_click_events": 2433969,
+    "train_unique_exposures": 6683040,
+    "validation_users": 15928,
+    "test_users": 16015
+  },
+  "protocol": {
+    "seed": 1,
+    "list_length": 160,
+    "batch_size": 1024,
+    "maximum_joint_epochs": 400,
+    "early_stopping_patience": 10,
+    "selection_metric": "validation_auc",
+    "frozen_test_point_estimates": 1,
+    "confirmatory_test_analysis": "paired-user bootstrap after all choices were frozen",
+    "initial_checkpoint": "../baselines/reinforcens/checkpoints/pretrain_model_dis_zhihu.pkl"
+  },
+  "rns": {
+    "best_epoch": 9,
+    "validation": {"auc": 0.7473644241159145, "ndcg": 0.6708578391391754},
+    "test": {"auc": 0.7072659460916975, "ndcg": 0.6621657701880107},
+    "checkpoint_sha256": "9f8c2d826b70ba8a6180942af63a42c71b2ebf6fac699f7e3964b2138beb56b8"
+  },
+  "ehrns": {
+    "exposure_pretrain_epochs": 5,
+    "exposure_holdout_final": {"nce": 0.7406186908483505, "pairwise_auc": 0.9155230522155762},
+    "best_epoch": 11,
+    "validation": {"auc": 0.7474101213113806, "ndcg": 0.6710116074399453},
+    "test": {"auc": 0.7074900363545471, "ndcg": 0.6623852864486006},
+    "checkpoint_sha256": "8bb5001676c48f4ea3c46e8c2b496e3d3e7d8825fb782bffe4e17106099d6edc"
+  },
+  "test_delta_ehrns_minus_rns": {
+    "auc": 0.00022409026284950622,
+    "ndcg": 0.00021951626058996273
+  },
+  "paired_bootstrap_10000": {
+    "unit": "user",
+    "auc_delta_95_percent_ci": [0.00006990239889264256, 0.0003754140449753582],
+    "auc_nonpositive_tail_probability": 0.0023997600239976003,
+    "ndcg_delta_95_percent_ci": [-0.00025476743414146457, 0.0006886285879889676],
+    "ndcg_nonpositive_tail_probability": 0.1832816718328167
+  },
+  "claim_scope": "single-seed point-estimate win on the frozen local RNS benchmark; AUC CI is positive, NDCG CI crosses zero"
+}

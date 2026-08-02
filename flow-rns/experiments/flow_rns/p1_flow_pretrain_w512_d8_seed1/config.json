@@ -1,0 +1,33 @@
+{
+  "data_source": "/home/chen/research/flowns/baselines/reinforcens/data/zhihu/train-valid-test.zip",
+  "flow": {
+    "depth": 8,
+    "embedding_dim": 32,
+    "hidden_dim": 512,
+    "num_users": 16015,
+    "reconstruction_weight": 0.25,
+    "sampling_steps": 16,
+    "time_dim": 128,
+    "user_dim": 128
+  },
+  "num_parameters": 10501536,
+  "train_split_only": true,
+  "training": {
+    "amp": true,
+    "batch_size": 2048,
+    "device": "cuda",
+    "diagnostics_examples": 4096,
+    "diagnostics_projections": 64,
+    "early_stopping_patience": 5,
+    "epochs": 50,
+    "gradient_clip": 1.0,
+    "learning_rate": 0.0002,
+    "maximum_training_exposures": null,
+    "minimum_epochs": 10,
+    "minimum_relative_improvement": 0.005,
+    "seed": 1,
+    "validation_examples": 131072,
+    "validation_fraction": 0.02,
+    "weight_decay": 1e-05
+  }
+}

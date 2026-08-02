@@ -1,0 +1,50 @@
+{
+  "data_source": "/home/chen/research/flowns/baselines/reinforcens/data/zhihu/train-valid-test.zip",
+  "flow": {
+    "depth": 8,
+    "embedding_dim": 32,
+    "hidden_dim": 512,
+    "num_users": 16015,
+    "reconstruction_weight": 0.25,
+    "sampling_steps": 16,
+    "time_dim": 128,
+    "user_dim": 128
+  },
+  "initialization": {
+    "checkpoint": "/home/chen/research/flowns/flow-rns/experiments/flow_rns/p1_flow_pretrain_w512_d8_seed1/best.pt",
+    "optimizer_state_reused": false,
+    "source_epoch": 50,
+    "source_metrics": {
+      "diagnostic_generated_norm": 5.984393119812012,
+      "diagnostic_mean_rmse": 0.03149695694446564,
+      "diagnostic_sliced_wasserstein": 0.056363239884376526,
+      "diagnostic_std_rmse": 0.03365354239940643,
+      "diagnostic_target_norm": 6.133486270904541,
+      "epoch": 50,
+      "validation_endpoint_mse": 0.3412177236750722,
+      "validation_examples": 131072,
+      "validation_loss": 0.9131745873019099,
+      "validation_velocity_mse": 0.8278701556846499
+    }
+  },
+  "num_parameters": 10501536,
+  "train_split_only": true,
+  "training": {
+    "amp": true,
+    "batch_size": 2048,
+    "device": "cuda",
+    "diagnostics_examples": 4096,
+    "diagnostics_projections": 64,
+    "early_stopping_patience": 5,
+    "epochs": 20,
+    "gradient_clip": 1.0,
+    "learning_rate": 5e-05,
+    "maximum_training_exposures": null,
+    "minimum_epochs": 5,
+    "minimum_relative_improvement": 0.002,
+    "seed": 1,
+    "validation_examples": 131072,
+    "validation_fraction": 0.02,
+    "weight_decay": 1e-05
+  }
+}

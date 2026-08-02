@@ -1,0 +1,23 @@
+{
+  "verdict": "WARN",
+  "reason_code": "verify_papers_unavailable",
+  "summary": "verify_papers.py was unresolved in the canonical helper chain; official arXiv pages were found through web search, but all candidates remain machine-unverified for audit visibility.",
+  "papers": [
+    {"id": "p1", "arxiv_id": "2210.02747", "doi": null, "title": "Flow Matching for Generative Modeling", "status": "unverified", "method": "none"},
+    {"id": "p2", "arxiv_id": "2302.00482", "doi": null, "title": "Improving and generalizing flow-based generative models with minibatch optimal transport", "status": "unverified", "method": "none"},
+    {"id": "p3", "arxiv_id": "2505.16298", "doi": null, "title": "Flow Matching based Sequential Recommender Model", "status": "unverified", "method": "none"},
+    {"id": "p4", "arxiv_id": "2304.00686", "doi": null, "title": "DiffuRec: A Diffusion Model for Sequential Recommendation", "status": "unverified", "method": "none"},
+    {"id": "p5", "arxiv_id": "2310.20453", "doi": null, "title": "Generate What You Prefer: Reshaping Sequential Recommendation via Guided Diffusion", "status": "unverified", "method": "none"},
+    {"id": "p6", "arxiv_id": "2305.05065", "doi": null, "title": "Recommender Systems with Generative Retrieval", "status": "unverified", "method": "none"},
+    {"id": "p7", "arxiv_id": "2505.05470", "doi": null, "title": "Flow-GRPO: Training Flow Matching Models via Online RL", "status": "unverified", "method": "none"},
+    {"id": "p8", "arxiv_id": "2507.15073", "doi": null, "title": "Reinforcement Learning for Flow-Matching Policies", "status": "unverified", "method": "none"},
+    {"id": "p9", "arxiv_id": "2302.03472", "doi": null, "title": "On the Theories Behind Hard Negative Sampling for Recommendation", "status": "unverified", "method": "none"},
+    {"id": "p10", "arxiv_id": "2211.13912", "doi": null, "title": "Enhancing Recommender Systems: A Strategy to Mitigate False Negative Impact", "status": "unverified", "method": "none"},
+    {"id": "p11", "arxiv_id": "2502.07303", "doi": null, "title": "Flow Matching for Collaborative Filtering", "status": "unverified", "method": "none"},
+    {"id": "p12", "arxiv_id": "2403.19276", "doi": null, "title": "Enhanced Bayesian Personalized Ranking for Robust Hard Negative Sampling in Recommender Systems", "status": "unverified", "method": "none"},
+    {"id": "p13", "arxiv_id": "2411.07770", "doi": null, "title": "A Theoretical Analysis of Recommendation Loss Functions under Negative Sampling", "status": "unverified", "method": "none"},
+    {"id": "p14", "arxiv_id": "2508.17618", "doi": null, "title": "Preference Trajectory Modeling via Flow Matching for Sequential Recommendation", "status": "unverified", "method": "none"},
+    {"id": "p15", "arxiv_id": "2405.07314", "doi": null, "title": "Learnable Item Tokenization for Generative Recommendation", "status": "unverified", "method": "none"},
+    {"id": "p16", "arxiv_id": "2207.02468", "doi": null, "title": "Re-weighting Negative Samples for Model-Agnostic Matching", "status": "unverified", "method": "none"}
+  ]
+}

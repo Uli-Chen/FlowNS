@@ -1,0 +1,45 @@
+{
+  "auc": {
+    "baseline_mean": 0.7072659460916975,
+    "candidate_mean": 0.7074900363545471,
+    "candidate_wins": 8014,
+    "ci_lower": 6.990239889264256e-05,
+    "ci_upper": 0.0003754140449753582,
+    "confidence": 0.95,
+    "mean_delta": 0.00022409026284950622,
+    "nonpositive_tail_probability": 0.0023997600239976003,
+    "resamples": 10000,
+    "seed": 20260802,
+    "ties": 469,
+    "users": 16015
+  },
+  "baseline": {
+    "checkpoint": "../baselines/reinforcens/runs/rns/best.pt",
+    "model": "rns"
+  },
+  "candidate": {
+    "checkpoint": "runs/ehrns/best.pt",
+    "model": "ehrns"
+  },
+  "ndcg": {
+    "baseline_mean": 0.6621657701880107,
+    "candidate_mean": 0.6623852864486006,
+    "candidate_wins": 8040,
+    "ci_lower": -0.00025476743414146457,
+    "ci_upper": 0.0006886285879889676,
+    "confidence": 0.95,
+    "mean_delta": 0.00021951626058996273,
+    "nonpositive_tail_probability": 0.1832816718328167,
+    "resamples": 10000,
+    "seed": 20260803,
+    "ties": 114,
+    "users": 16015
+  },
+  "protocol": {
+    "confidence": 0.95,
+    "evaluation_seed": 1,
+    "list_length": 160,
+    "paired_unit": "user",
+    "split": "test"
+  }
+}

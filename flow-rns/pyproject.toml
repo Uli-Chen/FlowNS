@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flow-rns"
+version = "0.1.0"
+description = "Flow-matching negative sampling experiments for EH-RNS"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.26",
+  "torch>=2.2",
+  "reinforcens-torch",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+flow-rns = "flowrns.flow_cli:main"
+
+[tool.uv.sources]
+reinforcens-torch = { path = "../baselines/reinforcens", editable = true }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["flowrns*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
+addopts = "-q"

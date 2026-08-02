@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reinforcens-torch"
+version = "1.0.0"
+description = "PyTorch recommendation baselines centered on ReinforceNS"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.26",
+  "torch>=2.2",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+reinforcens-train = "reinforcens.cli:main"
+reinforcens-compare = "reinforcens.compare:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["reinforcens*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

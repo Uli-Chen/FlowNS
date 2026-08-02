@@ -1,0 +1,8 @@
+{
+  "best_epoch": 0,
+  "best_validation_ndcg": 0.6552538914576655,
+  "continuous_training_without_catalog_mapping": false,
+  "epochs_completed": 10,
+  "item_embeddings_frozen": true,
+  "official_test_used": false
+}
